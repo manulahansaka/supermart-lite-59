@@ -5,8 +5,9 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { useToast } from '@/hooks/use-toast';
-import { RotateCcw, AlertTriangle } from 'lucide-react';
+import { RotateCcw, AlertTriangle, Loader2 } from 'lucide-react';
 import { AdminPasswordDialog } from './AdminPasswordDialog';
+import { Progress } from '@/components/ui/progress';
 import {
   Dialog,
   DialogContent,
@@ -31,11 +32,19 @@ export const SystemRestore = ({ compact = false }: SystemRestoreProps) => {
   const { toast } = useToast();
   const [showAdminDialog, setShowAdminDialog] = useState(false);
   const [restorePeriod, setRestorePeriod] = useState<string>('1-day');
+  const [isRestoring, setIsRestoring] = useState(false);
+  const [restoreProgress, setRestoreProgress] = useState(0);
+  const [restoreMessage, setRestoreMessage] = useState('');
 
   const handleRestore = async () => {
     try {
+      setIsRestoring(true);
+      setRestoreProgress(0);
+      setRestoreMessage('Preparing restore...');
+
       const now = new Date();
       let cutoffDate = new Date();
+      const isFullRestore = restorePeriod === 'all';
 
       switch (restorePeriod) {
         case '1-hour':
@@ -67,67 +76,149 @@ export const SystemRestore = ({ compact = false }: SystemRestoreProps) => {
           break;
       }
 
-      await db.transaction('rw', [db.sales, db.products, db.expenses], async () => {
-        // Delete sales after cutoff date
-        const salesToDelete = await db.sales
-          .filter(sale => new Date(sale.timestamp) >= cutoffDate)
-          .toArray();
-        
-        // Restore product stock and sync to cloud
-        for (const sale of salesToDelete) {
-          for (const item of sale.items) {
-            const product = await db.products.get(item.productId);
-            if (product) {
-              const newStock = (product.stock || 0) + item.quantity;
-              await db.products.update(item.productId, {
-                stock: newStock
-              });
-              // Sync stock update to cloud
-              await syncService.updateProductStockInCloud(product.barcode, newStock);
-            }
+      if (isFullRestore) {
+        // FULL RESTORE: Clear ALL local and cloud data
+        setRestoreMessage('Clearing all local data...');
+        setRestoreProgress(10);
+
+        // Clear all local tables
+        await db.transaction('rw', [db.sales, db.products, db.expenses, db.customers, db.cashiers, db.categories, db.suppliers, db.units, db.quickQuantities, db.syncLogs], async () => {
+          await db.sales.clear();
+          await db.expenses.clear();
+          await db.products.clear();
+          await db.customers.clear();
+          // Keep super_admin cashier
+          const superAdmin = await db.cashiers.where('role').equals('super_admin').first();
+          await db.cashiers.clear();
+          if (superAdmin) {
+            await db.cashiers.add(superAdmin);
           }
-        }
+          await db.categories.clear();
+          await db.suppliers.clear();
+          await db.units.clear();
+          await db.quickQuantities.clear();
+          await db.syncLogs.clear();
+        });
 
-        // Delete the sales locally
-        await db.sales
-          .filter(sale => new Date(sale.timestamp) >= cutoffDate)
-          .delete();
+        setRestoreMessage('Clearing all cloud data...');
+        setRestoreProgress(50);
 
-        // Delete expenses after cutoff date locally
-        await db.expenses
-          .filter(expense => new Date(expense.date) >= cutoffDate)
-          .delete();
+        // Clear all cloud data
+        await syncService.clearAllCloudData();
 
-        // Delete products added after cutoff date locally
-        await db.products
-          .filter(product => new Date(product.createdAt || 0) >= cutoffDate)
-          .delete();
-      });
+        setRestoreProgress(90);
+        setRestoreMessage('Finalizing...');
 
-      // Sync deletions to cloud
-      await syncService.deleteSalesFromCloudByTimestamp(cutoffDate);
-      await syncService.deleteExpensesFromCloudByDate(cutoffDate);
-      await syncService.deleteProductsFromCloudByDate(cutoffDate);
+        // Clear sync-related localStorage
+        localStorage.removeItem('last_sync_time');
+        localStorage.removeItem('last_sync_timestamps');
+        localStorage.removeItem('sync_checkpoint');
 
-      toast({
-        title: 'System Restored',
-        description: `All transactions from ${restorePeriod.replace('-', ' ')} ago have been reversed`,
-      });
+        setRestoreProgress(100);
+        setRestoreMessage('Complete!');
+
+        toast({
+          title: 'Full System Reset Complete',
+          description: 'All local and cloud data has been cleared. The system is ready for fresh data.',
+        });
+      } else {
+        // PARTIAL RESTORE: Restore to specific time period
+        setRestoreMessage('Finding transactions to restore...');
+        setRestoreProgress(10);
+
+        await db.transaction('rw', [db.sales, db.products, db.expenses], async () => {
+          // Get sales to delete
+          const salesToDelete = await db.sales
+            .filter(sale => new Date(sale.timestamp) >= cutoffDate)
+            .toArray();
+
+          setRestoreMessage(`Restoring ${salesToDelete.length} sales...`);
+          setRestoreProgress(30);
+
+          // Restore product stock for deleted sales
+          for (let i = 0; i < salesToDelete.length; i++) {
+            const sale = salesToDelete[i];
+            for (const item of sale.items) {
+              const product = await db.products.get(item.productId);
+              if (product) {
+                const newStock = (product.stock || 0) + item.quantity;
+                await db.products.update(item.productId, {
+                  stock: newStock
+                });
+                await syncService.updateProductStockInCloud(product.barcode, newStock);
+              }
+            }
+            setRestoreProgress(30 + Math.round((i / salesToDelete.length) * 30));
+          }
+
+          setRestoreMessage('Deleting sales...');
+          setRestoreProgress(60);
+
+          // Delete sales locally
+          await db.sales
+            .filter(sale => new Date(sale.timestamp) >= cutoffDate)
+            .delete();
+
+          setRestoreMessage('Deleting expenses...');
+          setRestoreProgress(70);
+
+          // Delete expenses locally
+          await db.expenses
+            .filter(expense => new Date(expense.date) >= cutoffDate)
+            .delete();
+
+          setRestoreMessage('Deleting products...');
+          setRestoreProgress(80);
+
+          // Delete products added after cutoff date
+          await db.products
+            .filter(product => {
+              const createdAt = product.createdAt;
+              if (!createdAt) return false;
+              return new Date(createdAt) >= cutoffDate;
+            })
+            .delete();
+        });
+
+        setRestoreMessage('Syncing deletions to cloud...');
+        setRestoreProgress(90);
+
+        // Sync deletions to cloud
+        await syncService.deleteSalesFromCloudByTimestamp(cutoffDate);
+        await syncService.deleteExpensesFromCloudByDate(cutoffDate);
+        await syncService.deleteProductsFromCloudByDate(cutoffDate);
+
+        setRestoreProgress(100);
+        setRestoreMessage('Complete!');
+
+        toast({
+          title: 'System Restored',
+          description: `All transactions from ${restorePeriod.replace('-', ' ')} ago have been reversed`,
+        });
+      }
 
       setShowAdminDialog(false);
     } catch (error) {
+      console.error('Restore error:', error);
       toast({
         title: 'Error',
-        description: 'Failed to restore system',
+        description: 'Failed to restore system. Please try again.',
         variant: 'destructive'
       });
+    } finally {
+      setIsRestoring(false);
+      setRestoreProgress(0);
+      setRestoreMessage('');
     }
   };
 
   const restoreContent = (
     <div className="space-y-4">
       <p className="text-sm text-muted-foreground">
-        Restore the system to a previous state by removing all transactions within a time period. This action cannot be undone.
+        Restore the system to a previous state by removing all transactions within a time period. 
+        {restorePeriod === 'all' && (
+          <span className="text-destructive font-medium"> Warning: "Everything" will permanently delete ALL local and cloud data!</span>
+        )}
       </p>
       
       <div className="space-y-2">
@@ -145,18 +236,35 @@ export const SystemRestore = ({ compact = false }: SystemRestoreProps) => {
             <SelectItem value="3-days">Last 3 Days</SelectItem>
             <SelectItem value="1-week">Last 1 Week</SelectItem>
             <SelectItem value="1-month">Last 1 Month</SelectItem>
-            <SelectItem value="all">Everything</SelectItem>
+            <SelectItem value="all">Everything (Complete Reset)</SelectItem>
           </SelectContent>
         </Select>
       </div>
+
+      {isRestoring && (
+        <div className="space-y-2">
+          <Progress value={restoreProgress} className="h-2" />
+          <p className="text-xs text-muted-foreground text-center">{restoreMessage}</p>
+        </div>
+      )}
 
       <Button 
         variant="destructive" 
         onClick={() => setShowAdminDialog(true)}
         className="w-full"
+        disabled={isRestoring}
       >
-        <RotateCcw className="mr-2 h-4 w-4" />
-        Restore System
+        {isRestoring ? (
+          <>
+            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            Restoring...
+          </>
+        ) : (
+          <>
+            <RotateCcw className="mr-2 h-4 w-4" />
+            {restorePeriod === 'all' ? 'Complete System Reset' : 'Restore System'}
+          </>
+        )}
       </Button>
     </div>
   );
@@ -189,8 +297,12 @@ export const SystemRestore = ({ compact = false }: SystemRestoreProps) => {
           open={showAdminDialog}
           onOpenChange={setShowAdminDialog}
           onConfirm={handleRestore}
-          title="Confirm System Restore"
-          description="This will permanently delete transactions and restore product stock. Enter admin password to continue."
+          title={restorePeriod === 'all' ? 'Confirm Complete System Reset' : 'Confirm System Restore'}
+          description={
+            restorePeriod === 'all' 
+              ? 'This will permanently delete ALL data from both local storage and cloud. This action CANNOT be undone. Enter admin password to continue.'
+              : 'This will permanently delete transactions and restore product stock. Enter admin password to continue.'
+          }
         />
       </>
     );
@@ -214,8 +326,12 @@ export const SystemRestore = ({ compact = false }: SystemRestoreProps) => {
         open={showAdminDialog}
         onOpenChange={setShowAdminDialog}
         onConfirm={handleRestore}
-        title="Confirm System Restore"
-        description="This will permanently delete transactions and restore product stock. Enter admin password to continue."
+        title={restorePeriod === 'all' ? 'Confirm Complete System Reset' : 'Confirm System Restore'}
+        description={
+          restorePeriod === 'all' 
+            ? 'This will permanently delete ALL data from both local storage and cloud. This action CANNOT be undone. Enter admin password to continue.'
+            : 'This will permanently delete transactions and restore product stock. Enter admin password to continue.'
+        }
       />
     </>
   );

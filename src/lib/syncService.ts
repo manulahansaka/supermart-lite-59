@@ -12,10 +12,26 @@ export interface SyncStatus {
   realtimeEnabled: boolean;
 }
 
+export interface SyncProgress {
+  isActive: boolean;
+  phase: 'idle' | 'pushing' | 'pulling' | 'complete' | 'error';
+  currentTable: string;
+  currentBatch: number;
+  totalBatches: number;
+  processedRecords: number;
+  totalRecords: number;
+  percentage: number;
+  message: string;
+}
+
 type SyncCallback = (status: SyncStatus) => void;
+type ProgressCallback = (progress: SyncProgress) => void;
+
+const BATCH_SIZE = 100;
+const SYNC_CHECKPOINT_KEY = 'sync_checkpoint';
+const LAST_SYNC_TIMESTAMPS_KEY = 'last_sync_timestamps';
 
 // Helper to safely convert to ISO string
-// Updated: 2025-12-05 - Using select-then-update pattern for conflict resolution
 const toISOString = (date: Date | string | null | undefined): string => {
   if (!date) return new Date().toISOString();
   if (typeof date === 'string') return date;
@@ -23,26 +39,47 @@ const toISOString = (date: Date | string | null | undefined): string => {
   return new Date().toISOString();
 };
 
+interface SyncCheckpoint {
+  table: string;
+  lastProcessedIndex: number;
+  timestamp: string;
+}
+
+interface LastSyncTimestamps {
+  [table: string]: string;
+}
+
 class SyncService {
   private deviceId: string;
   private isOnline: boolean = navigator.onLine;
   private isSyncing: boolean = false;
   private lastSyncTime: Date | null = null;
   private syncCallbacks: Set<SyncCallback> = new Set();
+  private progressCallbacks: Set<ProgressCallback> = new Set();
   private autoSyncInterval: number | null = null;
   private realtimeEnabled: boolean = true;
   private realtimeChannel: RealtimeChannel | null = null;
   private initialSyncDone: boolean = false;
   private lastError: string | null = null;
   private pendingChangesCount: number = 0;
+  
+  private currentProgress: SyncProgress = {
+    isActive: false,
+    phase: 'idle',
+    currentTable: '',
+    currentBatch: 0,
+    totalBatches: 0,
+    processedRecords: 0,
+    totalRecords: 0,
+    percentage: 0,
+    message: ''
+  };
 
   constructor() {
     this.deviceId = this.getOrCreateDeviceId();
     this.realtimeEnabled = localStorage.getItem('realtime_sync_enabled') !== 'false';
     this.setupEventListeners();
     this.startAutoSync();
-    
-    // Initial sync on load (important for login)
     this.performInitialSync();
   }
 
@@ -50,11 +87,7 @@ class SyncService {
     if (this.isOnline && !this.initialSyncDone) {
       console.log('[Sync] Performing initial sync on load...');
       await this.addSyncLog('pull', 'all', 0, 'success', 'Starting initial sync...');
-      
-      // Pull cashiers first for login
       await this.pullCashiers();
-      
-      // Then full sync
       const result = await this.sync();
       this.initialSyncDone = true;
       
@@ -62,7 +95,6 @@ class SyncService {
         await this.addSyncLog('pull', 'all', 0, 'success', 'Initial sync completed');
       }
       
-      // Setup realtime after initial sync
       if (this.realtimeEnabled) {
         this.setupRealtimeSubscriptions();
       }
@@ -129,7 +161,6 @@ class SyncService {
   private async handleRealtimeChange(table: string, payload: any) {
     const { eventType, new: newRecord, old: oldRecord } = payload;
     
-    // Skip if this change came from this device
     if (newRecord?.device_id === this.deviceId) {
       return;
     }
@@ -346,7 +377,6 @@ class SyncService {
     if (newRecord) {
       const localSettings = await db.settings.toArray();
       if (localSettings.length > 0) {
-        // Use cloud tax_rate value directly, don't default to 10
         const cloudTaxRate = newRecord.tax_rate !== null && newRecord.tax_rate !== undefined 
           ? Number(newRecord.tax_rate) 
           : localSettings[0].taxRate;
@@ -385,9 +415,32 @@ class SyncService {
     this.syncCallbacks.delete(callback);
   }
 
+  subscribeProgress(callback: ProgressCallback) {
+    this.progressCallbacks.add(callback);
+    callback(this.currentProgress);
+  }
+
+  unsubscribeProgress(callback: ProgressCallback) {
+    this.progressCallbacks.delete(callback);
+  }
+
   private notifyStatusChange() {
     const status = this.getStatus();
     this.syncCallbacks.forEach(callback => callback(status));
+  }
+
+  private notifyProgressChange() {
+    this.progressCallbacks.forEach(callback => callback(this.currentProgress));
+  }
+
+  private updateProgress(updates: Partial<SyncProgress>) {
+    this.currentProgress = { ...this.currentProgress, ...updates };
+    if (this.currentProgress.totalRecords > 0) {
+      this.currentProgress.percentage = Math.round(
+        (this.currentProgress.processedRecords / this.currentProgress.totalRecords) * 100
+      );
+    }
+    this.notifyProgressChange();
   }
 
   getStatus(): SyncStatus {
@@ -399,6 +452,10 @@ class SyncService {
       error: this.lastError,
       realtimeEnabled: this.realtimeEnabled
     };
+  }
+
+  getProgress(): SyncProgress {
+    return this.currentProgress;
   }
 
   clearError() {
@@ -438,7 +495,6 @@ class SyncService {
         message
       });
       
-      // Keep only last 500 logs
       const count = await db.syncLogs.count();
       if (count > 500) {
         const oldest = await db.syncLogs.orderBy('timestamp').limit(count - 500).toArray();
@@ -447,6 +503,35 @@ class SyncService {
     } catch (e) {
       console.error('[Sync] Error adding sync log:', e);
     }
+  }
+
+  private getLastSyncTimestamps(): LastSyncTimestamps {
+    const saved = localStorage.getItem(LAST_SYNC_TIMESTAMPS_KEY);
+    return saved ? JSON.parse(saved) : {};
+  }
+
+  private saveLastSyncTimestamp(table: string, timestamp: string) {
+    const timestamps = this.getLastSyncTimestamps();
+    timestamps[table] = timestamp;
+    localStorage.setItem(LAST_SYNC_TIMESTAMPS_KEY, JSON.stringify(timestamps));
+  }
+
+  private getCheckpoint(): SyncCheckpoint | null {
+    const saved = localStorage.getItem(SYNC_CHECKPOINT_KEY);
+    return saved ? JSON.parse(saved) : null;
+  }
+
+  private saveCheckpoint(table: string, lastProcessedIndex: number) {
+    const checkpoint: SyncCheckpoint = {
+      table,
+      lastProcessedIndex,
+      timestamp: new Date().toISOString()
+    };
+    localStorage.setItem(SYNC_CHECKPOINT_KEY, JSON.stringify(checkpoint));
+  }
+
+  private clearCheckpoint() {
+    localStorage.removeItem(SYNC_CHECKPOINT_KEY);
   }
 
   async sync(): Promise<{ success: boolean; error?: string }> {
@@ -464,13 +549,30 @@ class SyncService {
     this.lastError = null;
     this.notifyStatusChange();
 
-    try {
-      console.log('[Sync] Starting full sync...');
-      
-      // Push local changes to cloud
-      await this.pushLocalChanges();
+    this.updateProgress({
+      isActive: true,
+      phase: 'pushing',
+      currentTable: '',
+      currentBatch: 0,
+      totalBatches: 0,
+      processedRecords: 0,
+      totalRecords: 0,
+      percentage: 0,
+      message: 'Starting sync...'
+    });
 
-      // Pull cloud changes to local
+    try {
+      console.log('[Sync] Starting optimized delta+batch sync...');
+      
+      // Calculate total records for progress
+      const totalRecords = await this.calculateTotalRecords();
+      this.updateProgress({ totalRecords });
+
+      // Push local changes with delta detection
+      await this.pushLocalChangesDelta();
+
+      // Pull cloud changes
+      this.updateProgress({ phase: 'pulling', message: 'Downloading changes...' });
       await this.pullCloudChanges();
 
       this.lastSyncTime = new Date();
@@ -480,8 +582,17 @@ class SyncService {
       this.lastError = null;
       this.pendingChangesCount = 0;
       this.notifyStatusChange();
+      
+      this.updateProgress({
+        isActive: false,
+        phase: 'complete',
+        percentage: 100,
+        message: 'Sync completed successfully'
+      });
+      
+      this.clearCheckpoint();
 
-      console.log('[Sync] Full sync completed');
+      console.log('[Sync] Optimized sync completed');
       return { success: true };
     } catch (error) {
       console.error('[Sync] Sync error:', error);
@@ -489,46 +600,401 @@ class SyncService {
       this.lastError = errorMsg;
       this.isSyncing = false;
       this.notifyStatusChange();
+      
+      this.updateProgress({
+        isActive: false,
+        phase: 'error',
+        message: `Sync failed: ${errorMsg}`
+      });
+      
       await this.addSyncLog('push', 'all', 0, 'error', String(error));
-      return { 
-        success: false, 
-        error: errorMsg 
-      };
+      return { success: false, error: errorMsg };
     }
   }
 
-  // Instant push methods for real-time sync on local changes
+  private async calculateTotalRecords(): Promise<number> {
+    const products = await db.products.count();
+    const customers = await db.customers.count();
+    const sales = await db.sales.count();
+    const expenses = await db.expenses.count();
+    const cashiers = await db.cashiers.count();
+    const categories = await db.categories.count();
+    const suppliers = await db.suppliers.count();
+    const units = await db.units.count();
+    const quickQuantities = await db.quickQuantities.count();
+    
+    return products + customers + sales + expenses + cashiers + categories + suppliers + units + quickQuantities;
+  }
+
+  private async pushLocalChangesDelta() {
+    const lastSyncTimestamps = this.getLastSyncTimestamps();
+    const checkpoint = this.getCheckpoint();
+    let processedRecords = 0;
+
+    // Products - Delta sync (only push updated records)
+    const products = await db.products.toArray();
+    const productsToSync = products.filter(p => {
+      const lastSync = lastSyncTimestamps['products'];
+      if (!lastSync) return true;
+      return new Date(p.updatedAt) > new Date(lastSync);
+    });
+    
+    if (productsToSync.length > 0) {
+      this.updateProgress({ currentTable: 'products', message: `Syncing ${productsToSync.length} products...` });
+      await this.pushProductsBatch(productsToSync, checkpoint?.table === 'products' ? checkpoint.lastProcessedIndex : 0);
+      processedRecords += productsToSync.length;
+      this.saveLastSyncTimestamp('products', new Date().toISOString());
+    }
+    this.updateProgress({ processedRecords });
+
+    // Customers - Delta sync
+    const customers = await db.customers.toArray();
+    const customersToSync = customers.filter(c => {
+      const lastSync = lastSyncTimestamps['customers'];
+      if (!lastSync) return true;
+      return new Date(c.createdAt) > new Date(lastSync);
+    });
+    
+    if (customersToSync.length > 0) {
+      this.updateProgress({ currentTable: 'customers', message: `Syncing ${customersToSync.length} customers...` });
+      await this.pushCustomersBatch(customersToSync);
+      processedRecords += customersToSync.length;
+      this.saveLastSyncTimestamp('customers', new Date().toISOString());
+    }
+    this.updateProgress({ processedRecords });
+
+    // Sales - Push all (append-only)
+    const sales = await db.sales.toArray();
+    if (sales.length > 0) {
+      this.updateProgress({ currentTable: 'sales', message: `Syncing ${sales.length} sales...` });
+      await this.pushSalesBatch(sales);
+      processedRecords += sales.length;
+    }
+    this.updateProgress({ processedRecords });
+
+    // Expenses - Push all (append-only)
+    const expenses = await db.expenses.toArray();
+    if (expenses.length > 0) {
+      this.updateProgress({ currentTable: 'expenses', message: `Syncing ${expenses.length} expenses...` });
+      await this.pushExpensesBatch(expenses);
+      processedRecords += expenses.length;
+    }
+    this.updateProgress({ processedRecords });
+
+    // Cashiers, Categories, Suppliers, Units, QuickQuantities - Batch upsert
+    const cashiers = await db.cashiers.toArray();
+    if (cashiers.length > 0) {
+      this.updateProgress({ currentTable: 'cashiers', message: `Syncing ${cashiers.length} cashiers...` });
+      await this.pushCashiersBatch(cashiers);
+      processedRecords += cashiers.length;
+    }
+    this.updateProgress({ processedRecords });
+
+    const categories = await db.categories.toArray();
+    if (categories.length > 0) {
+      this.updateProgress({ currentTable: 'categories', message: `Syncing ${categories.length} categories...` });
+      await this.pushCategoriesBatch(categories);
+      processedRecords += categories.length;
+    }
+    this.updateProgress({ processedRecords });
+
+    const suppliers = await db.suppliers.toArray();
+    if (suppliers.length > 0) {
+      this.updateProgress({ currentTable: 'suppliers', message: `Syncing ${suppliers.length} suppliers...` });
+      await this.pushSuppliersBatch(suppliers);
+      processedRecords += suppliers.length;
+    }
+    this.updateProgress({ processedRecords });
+
+    const units = await db.units.toArray();
+    if (units.length > 0) {
+      this.updateProgress({ currentTable: 'units', message: `Syncing ${units.length} units...` });
+      await this.pushUnitsBatch(units);
+      processedRecords += units.length;
+    }
+    this.updateProgress({ processedRecords });
+
+    const quickQuantities = await db.quickQuantities.toArray();
+    if (quickQuantities.length > 0) {
+      this.updateProgress({ currentTable: 'quick_quantities', message: `Syncing ${quickQuantities.length} quick quantities...` });
+      await this.pushQuickQuantitiesBatch(quickQuantities);
+      processedRecords += quickQuantities.length;
+    }
+    this.updateProgress({ processedRecords });
+
+    // Settings
+    const settings = await db.settings.toArray();
+    if (settings.length > 0) {
+      this.updateProgress({ currentTable: 'settings', message: 'Syncing settings...' });
+      await this.pushSettings(settings[0]);
+    }
+
+    await this.addSyncLog('push', 'all', processedRecords, 'success', `Delta sync: ${processedRecords} records processed`);
+  }
+
+  // Batch push methods
+  private async pushProductsBatch(products: Product[], startIndex: number = 0) {
+    const batches = this.createBatches(products.slice(startIndex), BATCH_SIZE);
+    
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      this.saveCheckpoint('products', startIndex + (i * BATCH_SIZE));
+      
+      const records = batch.map(p => ({
+        local_id: p.id,
+        device_id: this.deviceId,
+        barcode: p.barcode,
+        name: p.name,
+        category: p.category || undefined,
+        cost_price: p.costPrice,
+        selling_price: p.sellingPrice,
+        stock: p.stock,
+        min_stock: p.minStock,
+        unit: p.unit,
+        image: p.image || undefined,
+        supplier: p.supplier || undefined,
+        discount_percent: p.discountPercent || undefined,
+        discount_start_date: p.discountStartDate ? toISOString(p.discountStartDate) : undefined,
+        discount_end_date: p.discountEndDate ? toISOString(p.discountEndDate) : undefined,
+        updated_at: toISOString(p.updatedAt)
+      }));
+
+      const { error } = await supabase.from('products').upsert(records, { onConflict: 'barcode' });
+      if (error) {
+        console.error('[Sync] Batch product push error:', error);
+        throw error;
+      }
+      
+      this.updateProgress({
+        currentBatch: i + 1,
+        totalBatches: batches.length,
+        message: `Products: batch ${i + 1}/${batches.length}`
+      });
+    }
+    
+    await this.addSyncLog('push', 'products', products.length, 'success', `Batch pushed ${products.length} products`);
+  }
+
+  private async pushCustomersBatch(customers: Customer[]) {
+    const batches = this.createBatches(customers, BATCH_SIZE);
+    
+    for (let i = 0; i < batches.length; i++) {
+      const batch = batches[i];
+      const records = batch.map(c => ({
+        local_id: c.id,
+        device_id: this.deviceId,
+        name: c.name,
+        phone: c.phone,
+        email: c.email || undefined,
+        loyalty_points: c.loyaltyPoints,
+        total_purchases: c.totalPurchases,
+        loan_balance: c.loanBalance,
+        loan_purchases: c.loanPurchases as any,
+        notes: c.notes || undefined,
+        updated_at: new Date().toISOString()
+      }));
+
+      const { error } = await supabase.from('customers').upsert(records, { onConflict: 'phone' });
+      if (error) throw error;
+    }
+    
+    await this.addSyncLog('push', 'customers', customers.length, 'success', `Batch pushed ${customers.length} customers`);
+  }
+
+  private async pushSalesBatch(sales: Sale[]) {
+    // For sales, we check which ones already exist to avoid duplicates
+    const existingIds = new Set<string>();
+    
+    const { data: cloudSales } = await supabase
+      .from('sales')
+      .select('device_id, local_id')
+      .eq('device_id', this.deviceId);
+    
+    if (cloudSales) {
+      cloudSales.forEach(s => existingIds.add(`${s.device_id}-${s.local_id}`));
+    }
+
+    const newSales = sales.filter(s => !existingIds.has(`${this.deviceId}-${s.id}`));
+    
+    if (newSales.length === 0) {
+      await this.addSyncLog('push', 'sales', 0, 'success', 'No new sales to push');
+      return;
+    }
+
+    const batches = this.createBatches(newSales, BATCH_SIZE);
+    
+    for (const batch of batches) {
+      const records = batch.map(s => ({
+        local_id: s.id,
+        device_id: this.deviceId,
+        items: s.items as any,
+        subtotal: s.subtotal,
+        tax: s.tax,
+        discount: s.discount,
+        total: s.total,
+        payment_method: s.paymentMethod,
+        amount_paid: s.amountPaid,
+        change: s.change,
+        customer_name: s.customerName || undefined,
+        cashier: s.cashier,
+        timestamp: toISOString(s.timestamp),
+        print_count: s.printCount,
+        print_history: (s.printHistory || []).map(d => toISOString(d)) as any
+      }));
+
+      const { error } = await supabase.from('sales').insert(records);
+      if (error && !error.message.includes('duplicate')) throw error;
+    }
+    
+    await this.addSyncLog('push', 'sales', newSales.length, 'success', `Batch pushed ${newSales.length} new sales`);
+  }
+
+  private async pushExpensesBatch(expenses: Expense[]) {
+    const existingIds = new Set<string>();
+    
+    const { data: cloudExpenses } = await supabase
+      .from('expenses')
+      .select('device_id, local_id')
+      .eq('device_id', this.deviceId);
+    
+    if (cloudExpenses) {
+      cloudExpenses.forEach(e => existingIds.add(`${e.device_id}-${e.local_id}`));
+    }
+
+    const newExpenses = expenses.filter(e => !existingIds.has(`${this.deviceId}-${e.id}`));
+    
+    if (newExpenses.length === 0) {
+      await this.addSyncLog('push', 'expenses', 0, 'success', 'No new expenses to push');
+      return;
+    }
+
+    const batches = this.createBatches(newExpenses, BATCH_SIZE);
+    
+    for (const batch of batches) {
+      const records = batch.map(e => ({
+        local_id: e.id,
+        device_id: this.deviceId,
+        category: e.category,
+        description: e.description || undefined,
+        amount: e.amount,
+        date: toISOString(e.date),
+        payment_method: e.paymentMethod,
+        expense_type: e.expenseType || undefined,
+        receipt: e.receipt || undefined,
+        created_by: e.createdBy,
+        created_at: toISOString(e.createdAt)
+      }));
+
+      const { error } = await supabase.from('expenses').insert(records);
+      if (error && !error.message.includes('duplicate')) throw error;
+    }
+    
+    await this.addSyncLog('push', 'expenses', newExpenses.length, 'success', `Batch pushed ${newExpenses.length} new expenses`);
+  }
+
+  private async pushCashiersBatch(cashiers: Cashier[]) {
+    const records = cashiers.map(c => ({
+      local_id: c.id,
+      device_id: this.deviceId,
+      name: c.name,
+      pin: c.pin,
+      role: c.role,
+      created_at: toISOString(c.createdAt),
+      updated_at: new Date().toISOString()
+    }));
+
+    const { error } = await supabase.from('cashiers').upsert(records, { onConflict: 'name' });
+    if (error) throw error;
+    
+    await this.addSyncLog('push', 'cashiers', cashiers.length, 'success', `Batch pushed ${cashiers.length} cashiers`);
+  }
+
+  private async pushCategoriesBatch(categories: Category[]) {
+    const records = categories.map(c => ({
+      local_id: c.id,
+      name: c.name
+    }));
+
+    const { error } = await supabase.from('categories').upsert(records, { onConflict: 'name' });
+    if (error) throw error;
+    
+    await this.addSyncLog('push', 'categories', categories.length, 'success', `Batch pushed ${categories.length} categories`);
+  }
+
+  private async pushSuppliersBatch(suppliers: Supplier[]) {
+    const records = suppliers.map(s => ({
+      local_id: s.id,
+      name: s.name,
+      contact: s.contact || undefined
+    }));
+
+    const { error } = await supabase.from('suppliers').upsert(records, { onConflict: 'name' });
+    if (error) throw error;
+    
+    await this.addSyncLog('push', 'suppliers', suppliers.length, 'success', `Batch pushed ${suppliers.length} suppliers`);
+  }
+
+  private async pushUnitsBatch(units: Unit[]) {
+    const records = units.map(u => ({
+      local_id: u.id,
+      name: u.name,
+      symbol: u.symbol
+    }));
+
+    const { error } = await supabase.from('units').upsert(records, { onConflict: 'name' });
+    if (error) throw error;
+    
+    await this.addSyncLog('push', 'units', units.length, 'success', `Batch pushed ${units.length} units`);
+  }
+
+  private async pushQuickQuantitiesBatch(qtys: QuickQuantity[]) {
+    const records = qtys.map(q => ({
+      local_id: q.id,
+      value: q.value,
+      label: q.label
+    }));
+
+    const { error } = await supabase.from('quick_quantities').upsert(records, { onConflict: 'label' });
+    if (error) throw error;
+    
+    await this.addSyncLog('push', 'quick_quantities', qtys.length, 'success', `Batch pushed ${qtys.length} quick quantities`);
+  }
+
+  private createBatches<T>(items: T[], batchSize: number): T[][] {
+    const batches: T[][] = [];
+    for (let i = 0; i < items.length; i += batchSize) {
+      batches.push(items.slice(i, i + batchSize));
+    }
+    return batches;
+  }
+
+  // Instant push methods for real-time sync
   async pushProductInstant(product: Product) {
     if (!this.isOnline) return;
-    await this.pushProduct(product);
-    await this.addSyncLog('push', 'products', 1, 'success', `Product ${product.name} synced`);
+    await this.pushProductsBatch([product]);
   }
 
   async pushCustomerInstant(customer: Customer) {
     if (!this.isOnline) return;
-    await this.pushCustomer(customer);
-    await this.addSyncLog('push', 'customers', 1, 'success', `Customer ${customer.name} synced`);
+    await this.pushCustomersBatch([customer]);
   }
 
   async pushSaleInstant(sale: Sale) {
     if (!this.isOnline) return;
-    await this.pushSale(sale);
-    await this.addSyncLog('push', 'sales', 1, 'success', `Sale synced`);
+    await this.pushSalesBatch([sale]);
   }
 
   async pushExpenseInstant(expense: Expense) {
     if (!this.isOnline) return;
-    await this.pushExpense(expense);
-    await this.addSyncLog('push', 'expenses', 1, 'success', `Expense synced`);
+    await this.pushExpensesBatch([expense]);
   }
 
   async pushCashierInstant(cashier: Cashier) {
     if (!this.isOnline) return;
-    await this.pushCashier(cashier);
-    await this.addSyncLog('push', 'cashiers', 1, 'success', `Cashier ${cashier.name} synced`);
+    await this.pushCashiersBatch([cashier]);
   }
 
-  // Delete methods - sync deletions to cloud
+  // Delete methods
   async deleteProductFromCloud(barcode: string) {
     if (!this.isOnline) return;
     try {
@@ -537,7 +1003,6 @@ class SyncService {
       await this.addSyncLog('push', 'products', 1, 'success', `Product deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error deleting product from cloud:', error);
-      await this.addSyncLog('push', 'products', 0, 'error', `Failed to delete product: ${error}`);
     }
   }
 
@@ -549,7 +1014,6 @@ class SyncService {
       await this.addSyncLog('push', 'customers', 1, 'success', `Customer deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error deleting customer from cloud:', error);
-      await this.addSyncLog('push', 'customers', 0, 'error', `Failed to delete customer: ${error}`);
     }
   }
 
@@ -558,10 +1022,8 @@ class SyncService {
     try {
       const { error } = await supabase.from('sales').delete().eq('device_id', deviceId).eq('local_id', localId);
       if (error) throw error;
-      await this.addSyncLog('push', 'sales', 1, 'success', `Sale deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error deleting sale from cloud:', error);
-      await this.addSyncLog('push', 'sales', 0, 'error', `Failed to delete sale: ${error}`);
     }
   }
 
@@ -570,10 +1032,8 @@ class SyncService {
     try {
       const { error } = await supabase.from('expenses').delete().eq('device_id', deviceId).eq('local_id', localId);
       if (error) throw error;
-      await this.addSyncLog('push', 'expenses', 1, 'success', `Expense deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error deleting expense from cloud:', error);
-      await this.addSyncLog('push', 'expenses', 0, 'error', `Failed to delete expense: ${error}`);
     }
   }
 
@@ -582,10 +1042,8 @@ class SyncService {
     try {
       const { error } = await supabase.from('cashiers').delete().eq('name', name);
       if (error) throw error;
-      await this.addSyncLog('push', 'cashiers', 1, 'success', `Cashier deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error deleting cashier from cloud:', error);
-      await this.addSyncLog('push', 'cashiers', 0, 'error', `Failed to delete cashier: ${error}`);
     }
   }
 
@@ -594,7 +1052,6 @@ class SyncService {
     try {
       const { error } = await supabase.from('categories').delete().eq('name', name);
       if (error) throw error;
-      await this.addSyncLog('push', 'categories', 1, 'success', `Category deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error deleting category from cloud:', error);
     }
@@ -605,7 +1062,6 @@ class SyncService {
     try {
       const { error } = await supabase.from('suppliers').delete().eq('name', name);
       if (error) throw error;
-      await this.addSyncLog('push', 'suppliers', 1, 'success', `Supplier deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error deleting supplier from cloud:', error);
     }
@@ -616,7 +1072,6 @@ class SyncService {
     try {
       const { error } = await supabase.from('units').delete().eq('name', name);
       if (error) throw error;
-      await this.addSyncLog('push', 'units', 1, 'success', `Unit deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error deleting unit from cloud:', error);
     }
@@ -628,10 +1083,8 @@ class SyncService {
     try {
       const { error } = await supabase.from('sales').delete().gte('timestamp', cutoffDate.toISOString());
       if (error) throw error;
-      await this.addSyncLog('push', 'sales', 1, 'success', `Sales after ${cutoffDate.toISOString()} deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error bulk deleting sales from cloud:', error);
-      await this.addSyncLog('push', 'sales', 0, 'error', `Failed to bulk delete sales: ${error}`);
     }
   }
 
@@ -640,10 +1093,8 @@ class SyncService {
     try {
       const { error } = await supabase.from('expenses').delete().gte('date', cutoffDate.toISOString());
       if (error) throw error;
-      await this.addSyncLog('push', 'expenses', 1, 'success', `Expenses after ${cutoffDate.toISOString()} deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error bulk deleting expenses from cloud:', error);
-      await this.addSyncLog('push', 'expenses', 0, 'error', `Failed to bulk delete expenses: ${error}`);
     }
   }
 
@@ -652,10 +1103,40 @@ class SyncService {
     try {
       const { error } = await supabase.from('products').delete().gte('created_at', cutoffDate.toISOString());
       if (error) throw error;
-      await this.addSyncLog('push', 'products', 1, 'success', `Products created after ${cutoffDate.toISOString()} deleted from cloud`);
     } catch (error) {
       console.error('[Sync] Error bulk deleting products from cloud:', error);
-      await this.addSyncLog('push', 'products', 0, 'error', `Failed to bulk delete products: ${error}`);
+    }
+  }
+
+  // Complete data wipe for system restore "Everything" option
+  async clearAllCloudData() {
+    if (!this.isOnline) return;
+    
+    console.log('[Sync] Clearing ALL cloud data...');
+    
+    try {
+      // Delete in order to avoid foreign key issues
+      await supabase.from('sales').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      await supabase.from('expenses').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      await supabase.from('products').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      await supabase.from('customers').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      await supabase.from('cashiers').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      await supabase.from('categories').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      await supabase.from('suppliers').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      await supabase.from('units').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      await supabase.from('quick_quantities').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      await supabase.from('settings').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      
+      // Clear sync timestamps to force full re-sync later
+      localStorage.removeItem(LAST_SYNC_TIMESTAMPS_KEY);
+      localStorage.removeItem(SYNC_CHECKPOINT_KEY);
+      
+      await this.addSyncLog('push', 'all', 0, 'success', 'All cloud data cleared');
+      console.log('[Sync] All cloud data cleared successfully');
+    } catch (error) {
+      console.error('[Sync] Error clearing cloud data:', error);
+      await this.addSyncLog('push', 'all', 0, 'error', `Failed to clear cloud data: ${error}`);
+      throw error;
     }
   }
 
@@ -673,339 +1154,8 @@ class SyncService {
     return this.deviceId;
   }
 
-  private async pushLocalChanges() {
-    const products = await db.products.toArray();
-    for (const product of products) {
-      await this.pushProduct(product);
-    }
-    await this.addSyncLog('push', 'products', products.length, 'success', `Pushed ${products.length} products to cloud`);
-
-    const customers = await db.customers.toArray();
-    for (const customer of customers) {
-      await this.pushCustomer(customer);
-    }
-    await this.addSyncLog('push', 'customers', customers.length, 'success', `Pushed ${customers.length} customers to cloud`);
-
-    const sales = await db.sales.toArray();
-    for (const sale of sales) {
-      await this.pushSale(sale);
-    }
-    await this.addSyncLog('push', 'sales', sales.length, 'success', `Pushed ${sales.length} sales to cloud`);
-
-    const expenses = await db.expenses.toArray();
-    for (const expense of expenses) {
-      await this.pushExpense(expense);
-    }
-    await this.addSyncLog('push', 'expenses', expenses.length, 'success', `Pushed ${expenses.length} expenses to cloud`);
-
-    const cashiers = await db.cashiers.toArray();
-    for (const cashier of cashiers) {
-      await this.pushCashier(cashier);
-    }
-    await this.addSyncLog('push', 'cashiers', cashiers.length, 'success', `Pushed ${cashiers.length} cashiers to cloud`);
-
-    const categories = await db.categories.toArray();
-    for (const category of categories) {
-      await this.pushCategory(category);
-    }
-    await this.addSyncLog('push', 'categories', categories.length, 'success', `Pushed ${categories.length} categories to cloud`);
-
-    const suppliers = await db.suppliers.toArray();
-    for (const supplier of suppliers) {
-      await this.pushSupplier(supplier);
-    }
-    await this.addSyncLog('push', 'suppliers', suppliers.length, 'success', `Pushed ${suppliers.length} suppliers to cloud`);
-
-    const units = await db.units.toArray();
-    for (const unit of units) {
-      await this.pushUnit(unit);
-    }
-    await this.addSyncLog('push', 'units', units.length, 'success', `Pushed ${units.length} units to cloud`);
-
-    const quickQuantities = await db.quickQuantities.toArray();
-    for (const qty of quickQuantities) {
-      await this.pushQuickQuantity(qty);
-    }
-    await this.addSyncLog('push', 'quick_quantities', quickQuantities.length, 'success', `Pushed ${quickQuantities.length} quick quantities to cloud`);
-
-    const settings = await db.settings.toArray();
-    for (const setting of settings) {
-      await this.pushSettings(setting);
-    }
-    await this.addSyncLog('push', 'settings', settings.length, 'success', `Pushed ${settings.length} settings to cloud`);
-  }
-
-  private async pushProduct(product: Product) {
-    try {
-      const { error } = await supabase
-        .from('products')
-        .upsert({
-          local_id: product.id,
-          device_id: this.deviceId,
-          barcode: product.barcode,
-          name: product.name,
-          category: product.category || undefined,
-          cost_price: product.costPrice,
-          selling_price: product.sellingPrice,
-          stock: product.stock,
-          min_stock: product.minStock,
-          unit: product.unit,
-          image: product.image || undefined,
-          supplier: product.supplier || undefined,
-          discount_percent: product.discountPercent || undefined,
-          discount_start_date: product.discountStartDate ? toISOString(product.discountStartDate) : undefined,
-          discount_end_date: product.discountEndDate ? toISOString(product.discountEndDate) : undefined,
-          updated_at: toISOString(product.updatedAt)
-        }, { onConflict: 'barcode' });
-
-      if (error) {
-        console.error('[Sync] Error pushing product:', error);
-        throw error;
-      }
-    } catch (error) {
-      await this.addSyncLog('push', 'products', 0, 'error', `Failed to push product ${product.name}: ${error}`);
-      throw error;
-    }
-  }
-
-  private async pushCustomer(customer: Customer) {
-    try {
-      const { error } = await supabase
-        .from('customers')
-        .upsert({
-          local_id: customer.id,
-          device_id: this.deviceId,
-          name: customer.name,
-          phone: customer.phone,
-          email: customer.email || undefined,
-          loyalty_points: customer.loyaltyPoints,
-          total_purchases: customer.totalPurchases,
-          loan_balance: customer.loanBalance,
-          loan_purchases: customer.loanPurchases as any,
-          notes: customer.notes || undefined,
-          updated_at: new Date().toISOString()
-        }, { onConflict: 'phone' });
-
-      if (error) {
-        console.error('[Sync] Error pushing customer:', error);
-        throw error;
-      }
-    } catch (error) {
-      await this.addSyncLog('push', 'customers', 0, 'error', `Failed to push customer ${customer.name}: ${error}`);
-      throw error;
-    }
-  }
-
-  private async pushSale(sale: Sale) {
-    try {
-      // Check if sale already exists in cloud
-      const { data: existing } = await supabase
-        .from('sales')
-        .select('id')
-        .eq('device_id', this.deviceId)
-        .eq('local_id', sale.id)
-        .maybeSingle();
-
-      const saleData = {
-        local_id: sale.id,
-        device_id: this.deviceId,
-        items: sale.items as any,
-        subtotal: sale.subtotal,
-        tax: sale.tax,
-        discount: sale.discount,
-        total: sale.total,
-        payment_method: sale.paymentMethod,
-        amount_paid: sale.amountPaid,
-        change: sale.change,
-        customer_name: sale.customerName || undefined,
-        cashier: sale.cashier,
-        timestamp: toISOString(sale.timestamp),
-        print_count: sale.printCount,
-        print_history: (sale.printHistory || []).map(d => toISOString(d)) as any
-      };
-
-      let error;
-      if (existing) {
-        // Update existing record
-        const result = await supabase
-          .from('sales')
-          .update(saleData)
-          .eq('id', existing.id);
-        error = result.error;
-      } else {
-        // Insert new record
-        const result = await supabase
-          .from('sales')
-          .insert(saleData);
-        error = result.error;
-      }
-
-      if (error) {
-        console.error('[Sync] Error pushing sale:', error);
-        throw error;
-      }
-    } catch (error) {
-      await this.addSyncLog('push', 'sales', 0, 'error', `Failed to push sale: ${error}`);
-      throw error;
-    }
-  }
-
-  private async pushExpense(expense: Expense) {
-    try {
-      // Check if expense already exists in cloud
-      const { data: existing } = await supabase
-        .from('expenses')
-        .select('id')
-        .eq('device_id', this.deviceId)
-        .eq('local_id', expense.id)
-        .maybeSingle();
-
-      const expenseData = {
-        local_id: expense.id,
-        device_id: this.deviceId,
-        category: expense.category,
-        description: expense.description || undefined,
-        amount: expense.amount,
-        date: toISOString(expense.date),
-        payment_method: expense.paymentMethod,
-        expense_type: expense.expenseType || undefined,
-        receipt: expense.receipt || undefined,
-        created_by: expense.createdBy,
-        created_at: toISOString(expense.createdAt)
-      };
-
-      let error;
-      if (existing) {
-        // Update existing record
-        const result = await supabase
-          .from('expenses')
-          .update(expenseData)
-          .eq('id', existing.id);
-        error = result.error;
-      } else {
-        // Insert new record
-        const result = await supabase
-          .from('expenses')
-          .insert(expenseData);
-        error = result.error;
-      }
-
-      if (error) {
-        console.error('[Sync] Error pushing expense:', error);
-        throw error;
-      }
-    } catch (error) {
-      await this.addSyncLog('push', 'expenses', 0, 'error', `Failed to push expense: ${error}`);
-      throw error;
-    }
-  }
-
-  private async pushCashier(cashier: Cashier) {
-    try {
-      const { error } = await supabase
-        .from('cashiers')
-        .upsert({
-          local_id: cashier.id,
-          device_id: this.deviceId,
-          name: cashier.name,
-          pin: cashier.pin,
-          role: cashier.role,
-          created_at: toISOString(cashier.createdAt),
-          updated_at: toISOString(new Date())
-        }, { onConflict: 'name' });
-
-      if (error) {
-        console.error('[Sync] Error pushing cashier:', error);
-        throw error;
-      }
-    } catch (error) {
-      await this.addSyncLog('push', 'cashiers', 0, 'error', `Failed to push cashier ${cashier.name}: ${error}`);
-      throw error;
-    }
-  }
-
-  private async pushCategory(category: Category) {
-    try {
-      const { error } = await supabase
-        .from('categories')
-        .upsert({
-          local_id: category.id,
-          name: category.name
-        }, { onConflict: 'name' });
-
-      if (error) {
-        console.error('[Sync] Error pushing category:', error);
-        throw error;
-      }
-    } catch (error) {
-      await this.addSyncLog('push', 'categories', 0, 'error', `Failed to push category ${category.name}: ${error}`);
-      throw error;
-    }
-  }
-
-  private async pushSupplier(supplier: Supplier) {
-    try {
-      const { error } = await supabase
-        .from('suppliers')
-        .upsert({
-          local_id: supplier.id,
-          name: supplier.name,
-          contact: supplier.contact || undefined
-        }, { onConflict: 'name' });
-
-      if (error) {
-        console.error('[Sync] Error pushing supplier:', error);
-        throw error;
-      }
-    } catch (error) {
-      await this.addSyncLog('push', 'suppliers', 0, 'error', `Failed to push supplier ${supplier.name}: ${error}`);
-      throw error;
-    }
-  }
-
-  private async pushUnit(unit: Unit) {
-    try {
-      const { error } = await supabase
-        .from('units')
-        .upsert({
-          local_id: unit.id,
-          name: unit.name,
-          symbol: unit.symbol
-        }, { onConflict: 'name' });
-
-      if (error) {
-        console.error('[Sync] Error pushing unit:', error);
-        throw error;
-      }
-    } catch (error) {
-      await this.addSyncLog('push', 'units', 0, 'error', `Failed to push unit ${unit.name}: ${error}`);
-      throw error;
-    }
-  }
-
-  private async pushQuickQuantity(qty: QuickQuantity) {
-    try {
-      const { error } = await supabase
-        .from('quick_quantities')
-        .upsert({
-          local_id: qty.id,
-          value: qty.value,
-          label: qty.label
-        }, { onConflict: 'label' });
-
-      if (error) {
-        console.error('[Sync] Error pushing quick quantity:', error);
-        throw error;
-      }
-    } catch (error) {
-      await this.addSyncLog('push', 'quick_quantities', 0, 'error', `Failed to push quick quantity ${qty.label}: ${error}`);
-      throw error;
-    }
-  }
-
   private async pushSettings(settings: Settings) {
     try {
-      // Check if settings already exist in cloud
       const { data: existing } = await supabase
         .from('settings')
         .select('id')
@@ -1027,34 +1177,17 @@ class SyncService {
         updated_at: new Date().toISOString()
       };
 
-      let error;
       if (existing) {
-        // Update existing record
-        const result = await supabase
-          .from('settings')
-          .update(settingsData)
-          .eq('id', existing.id);
-        error = result.error;
+        await supabase.from('settings').update(settingsData).eq('id', existing.id);
       } else {
-        // Insert new record
-        const result = await supabase
-          .from('settings')
-          .insert(settingsData);
-        error = result.error;
-      }
-
-      if (error) {
-        console.error('[Sync] Error pushing settings:', error);
-        throw error;
+        await supabase.from('settings').insert(settingsData);
       }
     } catch (error) {
-      await this.addSyncLog('push', 'settings', 0, 'error', `Failed to push settings: ${error}`);
-      throw error;
+      console.error('[Sync] Error pushing settings:', error);
     }
   }
 
   private async pullCloudChanges() {
-    // Pull cashiers first (important for login)
     await this.pullCashiers();
     await this.pullProducts();
     await this.pullCustomers();
@@ -1072,7 +1205,6 @@ class SyncService {
     
     if (error || !cloudProducts) {
       console.error('[Sync] Error pulling products:', error);
-      await this.addSyncLog('pull', 'products', 0, 'error', error?.message);
       return;
     }
 
@@ -1123,17 +1255,16 @@ class SyncService {
         }
       }
     }
-    await this.addSyncLog('pull', 'products', count, 'success', count > 0 ? `Pulled ${count} products from cloud` : 'Products up to date');
+    
+    if (count > 0) {
+      await this.addSyncLog('pull', 'products', count, 'success', `Pulled ${count} products`);
+    }
   }
 
   private async pullCustomers() {
     const { data: cloudCustomers, error } = await supabase.from('customers').select('*');
     
-    if (error || !cloudCustomers) {
-      console.error('[Sync] Error pulling customers:', error);
-      await this.addSyncLog('pull', 'customers', 0, 'error', error?.message);
-      return;
-    }
+    if (error || !cloudCustomers) return;
 
     let count = 0;
     for (const cloud of cloudCustomers) {
@@ -1152,35 +1283,18 @@ class SyncService {
           createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date()
         });
         count++;
-      } else {
-        const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
-        const localUpdatedAt = localCustomer.createdAt || new Date(0);
-        
-        if (cloudUpdatedAt > localUpdatedAt) {
-          await db.customers.update(localCustomer.id!, {
-            name: cloud.name,
-            email: cloud.email || undefined,
-            loyaltyPoints: cloud.loyalty_points || 0,
-            totalPurchases: Number(cloud.total_purchases) || 0,
-            loanBalance: Number(cloud.loan_balance) || 0,
-            loanPurchases: (cloud.loan_purchases as any[]) || [],
-            notes: cloud.notes || undefined
-          });
-          count++;
-        }
       }
     }
-    await this.addSyncLog('pull', 'customers', count, 'success', count > 0 ? `Pulled ${count} customers from cloud` : 'Customers up to date');
+    
+    if (count > 0) {
+      await this.addSyncLog('pull', 'customers', count, 'success', `Pulled ${count} customers`);
+    }
   }
 
   private async pullSales() {
     const { data: cloudSales, error } = await supabase.from('sales').select('*');
     
-    if (error || !cloudSales) {
-      console.error('[Sync] Error pulling sales:', error);
-      await this.addSyncLog('pull', 'sales', 0, 'error', error?.message);
-      return;
-    }
+    if (error || !cloudSales) return;
 
     let count = 0;
     for (const cloud of cloudSales) {
@@ -1209,17 +1323,16 @@ class SyncService {
         count++;
       }
     }
-    await this.addSyncLog('pull', 'sales', count, 'success', count > 0 ? `Pulled ${count} new sales from cloud` : 'Sales up to date');
+    
+    if (count > 0) {
+      await this.addSyncLog('pull', 'sales', count, 'success', `Pulled ${count} sales`);
+    }
   }
 
   private async pullExpenses() {
     const { data: cloudExpenses, error } = await supabase.from('expenses').select('*');
     
-    if (error || !cloudExpenses) {
-      console.error('[Sync] Error pulling expenses:', error);
-      await this.addSyncLog('pull', 'expenses', 0, 'error', error?.message);
-      return;
-    }
+    if (error || !cloudExpenses) return;
 
     let count = 0;
     for (const cloud of cloudExpenses) {
@@ -1244,17 +1357,16 @@ class SyncService {
         count++;
       }
     }
-    await this.addSyncLog('pull', 'expenses', count, 'success', count > 0 ? `Pulled ${count} new expenses from cloud` : 'Expenses up to date');
+    
+    if (count > 0) {
+      await this.addSyncLog('pull', 'expenses', count, 'success', `Pulled ${count} expenses`);
+    }
   }
 
   private async pullCashiers() {
     const { data: cloudCashiers, error } = await supabase.from('cashiers').select('*');
     
-    if (error || !cloudCashiers) {
-      console.error('[Sync] Error pulling cashiers:', error);
-      await this.addSyncLog('pull', 'cashiers', 0, 'error', error?.message);
-      return;
-    }
+    if (error || !cloudCashiers) return;
 
     let count = 0;
     for (const cloud of cloudCashiers) {
@@ -1281,16 +1393,16 @@ class SyncService {
         }
       }
     }
-    await this.addSyncLog('pull', 'cashiers', count, 'success', count > 0 ? `Pulled ${count} cashiers from cloud` : 'Cashiers up to date');
+    
+    if (count > 0) {
+      await this.addSyncLog('pull', 'cashiers', count, 'success', `Pulled ${count} cashiers`);
+    }
   }
 
   private async pullCategories() {
     const { data: cloudCategories, error } = await supabase.from('categories').select('*');
     
-    if (error || !cloudCategories) {
-      await this.addSyncLog('pull', 'categories', 0, 'error', error?.message);
-      return;
-    }
+    if (error || !cloudCategories) return;
 
     let count = 0;
     for (const cloud of cloudCategories) {
@@ -1300,16 +1412,16 @@ class SyncService {
         count++;
       }
     }
-    await this.addSyncLog('pull', 'categories', count, 'success', count > 0 ? `Pulled ${count} new categories from cloud` : 'Categories up to date');
+    
+    if (count > 0) {
+      await this.addSyncLog('pull', 'categories', count, 'success', `Pulled ${count} categories`);
+    }
   }
 
   private async pullSuppliers() {
     const { data: cloudSuppliers, error } = await supabase.from('suppliers').select('*');
     
-    if (error || !cloudSuppliers) {
-      await this.addSyncLog('pull', 'suppliers', 0, 'error', error?.message);
-      return;
-    }
+    if (error || !cloudSuppliers) return;
 
     let count = 0;
     for (const cloud of cloudSuppliers) {
@@ -1317,21 +1429,18 @@ class SyncService {
       if (!localSupplier) {
         await db.suppliers.add({ name: cloud.name, contact: cloud.contact || undefined });
         count++;
-      } else if (cloud.contact && !localSupplier.contact) {
-        await db.suppliers.update(localSupplier.id!, { contact: cloud.contact });
-        count++;
       }
     }
-    await this.addSyncLog('pull', 'suppliers', count, 'success', count > 0 ? `Pulled ${count} suppliers from cloud` : 'Suppliers up to date');
+    
+    if (count > 0) {
+      await this.addSyncLog('pull', 'suppliers', count, 'success', `Pulled ${count} suppliers`);
+    }
   }
 
   private async pullUnits() {
     const { data: cloudUnits, error } = await supabase.from('units').select('*');
     
-    if (error || !cloudUnits) {
-      await this.addSyncLog('pull', 'units', 0, 'error', error?.message);
-      return;
-    }
+    if (error || !cloudUnits) return;
 
     let count = 0;
     for (const cloud of cloudUnits) {
@@ -1341,16 +1450,16 @@ class SyncService {
         count++;
       }
     }
-    await this.addSyncLog('pull', 'units', count, 'success', count > 0 ? `Pulled ${count} new units from cloud` : 'Units up to date');
+    
+    if (count > 0) {
+      await this.addSyncLog('pull', 'units', count, 'success', `Pulled ${count} units`);
+    }
   }
 
   private async pullQuickQuantities() {
     const { data: cloudQtys, error } = await supabase.from('quick_quantities').select('*');
     
-    if (error || !cloudQtys) {
-      await this.addSyncLog('pull', 'quick_quantities', 0, 'error', error?.message);
-      return;
-    }
+    if (error || !cloudQtys) return;
 
     let count = 0;
     for (const cloud of cloudQtys) {
@@ -1360,21 +1469,21 @@ class SyncService {
         count++;
       }
     }
-    await this.addSyncLog('pull', 'quick_quantities', count, 'success', count > 0 ? `Pulled ${count} quick quantities from cloud` : 'Quick quantities up to date');
+    
+    if (count > 0) {
+      await this.addSyncLog('pull', 'quick_quantities', count, 'success', `Pulled ${count} quick quantities`);
+    }
   }
 
   private async pullSettings() {
     const { data: cloudSettings, error } = await supabase.from('settings').select('*').limit(1);
     
-    if (error || !cloudSettings || cloudSettings.length === 0) {
-      return;
-    }
+    if (error || !cloudSettings || cloudSettings.length === 0) return;
 
     const cloud = cloudSettings[0];
     const localSettings = await db.settings.toArray();
     
     if (localSettings.length > 0) {
-      // Use cloud tax_rate directly, don't default to 10
       const cloudTaxRate = cloud.tax_rate !== null && cloud.tax_rate !== undefined 
         ? Number(cloud.tax_rate) 
         : localSettings[0].taxRate;
@@ -1393,7 +1502,6 @@ class SyncService {
         exportFileName: cloud.export_file_name || undefined
       });
     }
-    await this.addSyncLog('pull', 'settings', 1, 'success', 'Settings synced from cloud');
   }
 
   destroy() {

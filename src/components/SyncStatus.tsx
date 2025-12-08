@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Cloud, CloudOff, RefreshCw, Check, AlertCircle, Radio, Settings2, RotateCcw } from "lucide-react";
-import { syncService, SyncStatus as SyncStatusType } from "@/lib/syncService";
+import { syncService, SyncStatus as SyncStatusType, SyncProgress } from "@/lib/syncService";
 import { useToast } from "@/hooks/use-toast";
+import { SyncProgressBar } from "./SyncProgressBar";
 import {
   Tooltip,
   TooltipContent,
@@ -31,6 +32,17 @@ export const SyncStatus = () => {
     error: null,
     realtimeEnabled: true
   });
+  const [progress, setProgress] = useState<SyncProgress>({
+    isActive: false,
+    phase: 'idle',
+    currentTable: '',
+    currentBatch: 0,
+    totalBatches: 0,
+    processedRecords: 0,
+    totalRecords: 0,
+    percentage: 0,
+    message: ''
+  });
   const [retryCount, setRetryCount] = useState(0);
 
   useEffect(() => {
@@ -38,7 +50,12 @@ export const SyncStatus = () => {
       setStatus(newStatus);
     };
 
+    const handleProgressChange = (newProgress: SyncProgress) => {
+      setProgress(newProgress);
+    };
+
     syncService.subscribe(handleStatusChange);
+    syncService.subscribeProgress(handleProgressChange);
 
     const lastSyncStr = localStorage.getItem('last_sync_time');
     if (lastSyncStr) {
@@ -47,6 +64,7 @@ export const SyncStatus = () => {
 
     return () => {
       syncService.unsubscribe(handleStatusChange);
+      syncService.unsubscribeProgress(handleProgressChange);
     };
   }, []);
 
@@ -232,6 +250,14 @@ export const SyncStatus = () => {
                 Configure how data syncs with the cloud.
               </p>
             </div>
+
+            {/* Show progress bar when syncing */}
+            {progress.isActive && (
+              <>
+                <SyncProgressBar progress={progress} />
+                <Separator />
+              </>
+            )}
             
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
