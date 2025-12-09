@@ -127,6 +127,10 @@ class SyncService {
     });
   }
 
+  private realtimeRetryCount: number = 0;
+  private realtimeRetryTimeout: number | null = null;
+  private readonly MAX_REALTIME_RETRIES = 5;
+
   private setupRealtimeSubscriptions() {
     if (this.realtimeChannel) {
       this.cleanupRealtimeSubscriptions();
@@ -146,9 +150,64 @@ class SyncService {
       .on('postgres_changes', { event: '*', schema: 'public', table: 'units' }, (payload) => this.handleRealtimeChange('units', payload))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'quick_quantities' }, (payload) => this.handleRealtimeChange('quick_quantities', payload))
       .on('postgres_changes', { event: '*', schema: 'public', table: 'settings' }, (payload) => this.handleRealtimeChange('settings', payload))
-      .subscribe((status) => {
-        console.log('[Sync] Realtime subscription status:', status);
+      .subscribe((status, err) => {
+        console.log('[Sync] Realtime subscription status:', status, err || '');
+        
+        if (status === 'SUBSCRIBED') {
+          this.realtimeRetryCount = 0;
+          console.log('[Sync] Realtime connected successfully');
+        } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+          console.error('[Sync] Realtime error, will retry...', err);
+          this.handleRealtimeError();
+        } else if (status === 'CLOSED') {
+          console.log('[Sync] Realtime channel closed');
+          if (this.isOnline && this.realtimeEnabled) {
+            this.handleRealtimeError();
+          }
+        }
       });
+  }
+
+  private handleRealtimeError() {
+    if (this.realtimeRetryTimeout) {
+      clearTimeout(this.realtimeRetryTimeout);
+    }
+
+    if (this.realtimeRetryCount < this.MAX_REALTIME_RETRIES) {
+      const delay = Math.min(1000 * Math.pow(2, this.realtimeRetryCount), 30000);
+      this.realtimeRetryCount++;
+      
+      console.log(`[Sync] Retrying realtime connection in ${delay}ms (attempt ${this.realtimeRetryCount}/${this.MAX_REALTIME_RETRIES})`);
+      
+      this.realtimeRetryTimeout = window.setTimeout(() => {
+        if (this.isOnline && this.realtimeEnabled) {
+          this.setupRealtimeSubscriptions();
+        }
+      }, delay);
+    } else {
+      console.warn('[Sync] Max realtime retries reached, falling back to polling');
+      this.startFallbackPolling();
+    }
+  }
+
+  private fallbackPollingInterval: number | null = null;
+
+  private startFallbackPolling() {
+    if (this.fallbackPollingInterval) return;
+    
+    console.log('[Sync] Starting fallback polling every 30 seconds');
+    this.fallbackPollingInterval = window.setInterval(() => {
+      if (this.isOnline && !this.isSyncing) {
+        this.pullCloudChanges();
+      }
+    }, 30000);
+  }
+
+  private stopFallbackPolling() {
+    if (this.fallbackPollingInterval) {
+      clearInterval(this.fallbackPollingInterval);
+      this.fallbackPollingInterval = null;
+    }
   }
 
   private cleanupRealtimeSubscriptions() {
@@ -1201,42 +1260,40 @@ class SyncService {
   }
 
   private async pullProducts() {
-    const { data: cloudProducts, error } = await supabase.from('products').select('*');
-    
-    if (error || !cloudProducts) {
-      console.error('[Sync] Error pulling products:', error);
-      return;
-    }
+    const PULL_BATCH_SIZE = 1000;
+    let offset = 0;
+    let hasMore = true;
+    let totalPulled = 0;
+    let totalUpdated = 0;
 
-    let count = 0;
-    for (const cloud of cloudProducts) {
-      const localProduct = await db.products.where('barcode').equals(cloud.barcode).first();
-      
-      if (!localProduct) {
-        await db.products.add({
-          barcode: cloud.barcode,
-          name: cloud.name,
-          category: cloud.category || '',
-          costPrice: Number(cloud.cost_price),
-          sellingPrice: Number(cloud.selling_price),
-          stock: cloud.stock || 0,
-          minStock: cloud.min_stock || 0,
-          unit: cloud.unit || 'piece',
-          image: cloud.image || undefined,
-          supplier: cloud.supplier || undefined,
-          discountPercent: cloud.discount_percent ? Number(cloud.discount_percent) : undefined,
-          discountStartDate: cloud.discount_start_date ? new Date(cloud.discount_start_date) : undefined,
-          discountEndDate: cloud.discount_end_date ? new Date(cloud.discount_end_date) : undefined,
-          createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date(),
-          updatedAt: cloud.updated_at ? new Date(cloud.updated_at) : new Date()
-        });
-        count++;
-      } else {
-        const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
-        const localUpdatedAt = localProduct.updatedAt || new Date(0);
+    console.log('[Sync] Starting paginated product pull...');
+    this.updateProgress({ currentTable: 'products', message: 'Downloading products...' });
+
+    while (hasMore) {
+      const { data: cloudProducts, error } = await supabase
+        .from('products')
+        .select('*')
+        .range(offset, offset + PULL_BATCH_SIZE - 1)
+        .order('created_at', { ascending: true });
+
+      if (error) {
+        console.error('[Sync] Error pulling products batch:', error);
+        break;
+      }
+
+      if (!cloudProducts || cloudProducts.length === 0) {
+        hasMore = false;
+        break;
+      }
+
+      console.log(`[Sync] Pulled products batch: ${offset}-${offset + cloudProducts.length} (${cloudProducts.length} items)`);
+
+      for (const cloud of cloudProducts) {
+        const localProduct = await db.products.where('barcode').equals(cloud.barcode).first();
         
-        if (cloudUpdatedAt > localUpdatedAt) {
-          await db.products.update(localProduct.id!, {
+        if (!localProduct) {
+          await db.products.add({
+            barcode: cloud.barcode,
             name: cloud.name,
             category: cloud.category || '',
             costPrice: Number(cloud.cost_price),
@@ -1249,15 +1306,49 @@ class SyncService {
             discountPercent: cloud.discount_percent ? Number(cloud.discount_percent) : undefined,
             discountStartDate: cloud.discount_start_date ? new Date(cloud.discount_start_date) : undefined,
             discountEndDate: cloud.discount_end_date ? new Date(cloud.discount_end_date) : undefined,
-            updatedAt: cloudUpdatedAt
+            createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date(),
+            updatedAt: cloud.updated_at ? new Date(cloud.updated_at) : new Date()
           });
-          count++;
+          totalUpdated++;
+        } else {
+          const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
+          const localUpdatedAt = localProduct.updatedAt || new Date(0);
+          
+          if (cloudUpdatedAt > localUpdatedAt) {
+            await db.products.update(localProduct.id!, {
+              name: cloud.name,
+              category: cloud.category || '',
+              costPrice: Number(cloud.cost_price),
+              sellingPrice: Number(cloud.selling_price),
+              stock: cloud.stock || 0,
+              minStock: cloud.min_stock || 0,
+              unit: cloud.unit || 'piece',
+              image: cloud.image || undefined,
+              supplier: cloud.supplier || undefined,
+              discountPercent: cloud.discount_percent ? Number(cloud.discount_percent) : undefined,
+              discountStartDate: cloud.discount_start_date ? new Date(cloud.discount_start_date) : undefined,
+              discountEndDate: cloud.discount_end_date ? new Date(cloud.discount_end_date) : undefined,
+              updatedAt: cloudUpdatedAt
+            });
+            totalUpdated++;
+          }
         }
       }
+
+      totalPulled += cloudProducts.length;
+      offset += PULL_BATCH_SIZE;
+      hasMore = cloudProducts.length === PULL_BATCH_SIZE;
+
+      this.updateProgress({ 
+        message: `Downloaded ${totalPulled} products...`,
+        processedRecords: this.currentProgress.processedRecords + cloudProducts.length
+      });
     }
     
-    if (count > 0) {
-      await this.addSyncLog('pull', 'products', count, 'success', `Pulled ${count} products`);
+    console.log(`[Sync] Product pull complete: ${totalPulled} fetched, ${totalUpdated} added/updated`);
+    
+    if (totalUpdated > 0) {
+      await this.addSyncLog('pull', 'products', totalUpdated, 'success', `Pulled ${totalPulled} products (${totalUpdated} new/updated)`);
     }
   }
 
@@ -1292,40 +1383,58 @@ class SyncService {
   }
 
   private async pullSales() {
-    const { data: cloudSales, error } = await supabase.from('sales').select('*');
-    
-    if (error || !cloudSales) return;
-
+    const PULL_BATCH_SIZE = 1000;
+    let offset = 0;
+    let hasMore = true;
+    let totalPulled = 0;
     let count = 0;
-    for (const cloud of cloudSales) {
-      const existingSale = await db.sales
-        .where('timestamp')
-        .equals(new Date(cloud.timestamp!))
-        .filter(s => s.cashier === cloud.cashier && s.total === Number(cloud.total))
-        .first();
-      
-      if (!existingSale) {
-        await db.sales.add({
-          items: cloud.items as any[],
-          subtotal: Number(cloud.subtotal),
-          tax: Number(cloud.tax) || 0,
-          discount: Number(cloud.discount) || 0,
-          total: Number(cloud.total),
-          paymentMethod: cloud.payment_method as any,
-          amountPaid: Number(cloud.amount_paid),
-          change: Number(cloud.change) || 0,
-          customerName: cloud.customer_name || undefined,
-          cashier: cloud.cashier,
-          timestamp: new Date(cloud.timestamp!),
-          printCount: cloud.print_count || 0,
-          printHistory: ((cloud.print_history as any[]) || []).map((d: string) => new Date(d))
-        });
-        count++;
+
+    while (hasMore) {
+      const { data: cloudSales, error } = await supabase
+        .from('sales')
+        .select('*')
+        .range(offset, offset + PULL_BATCH_SIZE - 1)
+        .order('timestamp', { ascending: true });
+
+      if (error || !cloudSales || cloudSales.length === 0) {
+        hasMore = false;
+        break;
       }
+
+      for (const cloud of cloudSales) {
+        const existingSale = await db.sales
+          .where('timestamp')
+          .equals(new Date(cloud.timestamp!))
+          .filter(s => s.cashier === cloud.cashier && s.total === Number(cloud.total))
+          .first();
+        
+        if (!existingSale) {
+          await db.sales.add({
+            items: cloud.items as any[],
+            subtotal: Number(cloud.subtotal),
+            tax: Number(cloud.tax) || 0,
+            discount: Number(cloud.discount) || 0,
+            total: Number(cloud.total),
+            paymentMethod: cloud.payment_method as any,
+            amountPaid: Number(cloud.amount_paid),
+            change: Number(cloud.change) || 0,
+            customerName: cloud.customer_name || undefined,
+            cashier: cloud.cashier,
+            timestamp: new Date(cloud.timestamp!),
+            printCount: cloud.print_count || 0,
+            printHistory: ((cloud.print_history as any[]) || []).map((d: string) => new Date(d))
+          });
+          count++;
+        }
+      }
+
+      totalPulled += cloudSales.length;
+      offset += PULL_BATCH_SIZE;
+      hasMore = cloudSales.length === PULL_BATCH_SIZE;
     }
     
     if (count > 0) {
-      await this.addSyncLog('pull', 'sales', count, 'success', `Pulled ${count} sales`);
+      await this.addSyncLog('pull', 'sales', count, 'success', `Pulled ${count} sales from ${totalPulled} total`);
     }
   }
 
@@ -1508,6 +1617,10 @@ class SyncService {
     if (this.autoSyncInterval) {
       clearInterval(this.autoSyncInterval);
     }
+    if (this.realtimeRetryTimeout) {
+      clearTimeout(this.realtimeRetryTimeout);
+    }
+    this.stopFallbackPolling();
     this.cleanupRealtimeSubscriptions();
     window.removeEventListener('online', () => {});
     window.removeEventListener('offline', () => {});
