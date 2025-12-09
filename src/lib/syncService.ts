@@ -1353,32 +1353,77 @@ class SyncService {
   }
 
   private async pullCustomers() {
-    const { data: cloudCustomers, error } = await supabase.from('customers').select('*');
-    
-    if (error || !cloudCustomers) return;
-
+    const PULL_BATCH_SIZE = 1000;
+    let offset = 0;
+    let hasMore = true;
+    let totalPulled = 0;
     let count = 0;
-    for (const cloud of cloudCustomers) {
-      const localCustomer = await db.customers.where('phone').equals(cloud.phone).first();
-      
-      if (!localCustomer) {
-        await db.customers.add({
-          name: cloud.name,
-          phone: cloud.phone,
-          email: cloud.email || undefined,
-          loyaltyPoints: cloud.loyalty_points || 0,
-          totalPurchases: Number(cloud.total_purchases) || 0,
-          loanBalance: Number(cloud.loan_balance) || 0,
-          loanPurchases: (cloud.loan_purchases as any[]) || [],
-          notes: cloud.notes || undefined,
-          createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date()
-        });
-        count++;
+
+    console.log('[Sync] Starting paginated customer pull...');
+    this.updateProgress({ currentTable: 'customers', message: 'Downloading customers...' });
+
+    while (hasMore) {
+      const { data: cloudCustomers, error } = await supabase
+        .from('customers')
+        .select('*')
+        .range(offset, offset + PULL_BATCH_SIZE - 1)
+        .order('created_at', { ascending: true });
+
+      if (error || !cloudCustomers || cloudCustomers.length === 0) {
+        hasMore = false;
+        break;
       }
+
+      for (const cloud of cloudCustomers) {
+        const localCustomer = await db.customers.where('phone').equals(cloud.phone).first();
+        
+        if (!localCustomer) {
+          await db.customers.add({
+            name: cloud.name,
+            phone: cloud.phone,
+            email: cloud.email || undefined,
+            loyaltyPoints: cloud.loyalty_points || 0,
+            totalPurchases: Number(cloud.total_purchases) || 0,
+            loanBalance: Number(cloud.loan_balance) || 0,
+            loanPurchases: (cloud.loan_purchases as any[]) || [],
+            notes: cloud.notes || undefined,
+            createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date()
+          });
+          count++;
+        } else {
+          // Update existing customer if cloud version is newer
+          const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
+          const localUpdatedAt = localCustomer.createdAt || new Date(0);
+          
+          if (cloudUpdatedAt > localUpdatedAt) {
+            await db.customers.update(localCustomer.id!, {
+              name: cloud.name,
+              email: cloud.email || undefined,
+              loyaltyPoints: cloud.loyalty_points || 0,
+              totalPurchases: Number(cloud.total_purchases) || 0,
+              loanBalance: Number(cloud.loan_balance) || 0,
+              loanPurchases: (cloud.loan_purchases as any[]) || [],
+              notes: cloud.notes || undefined
+            });
+            count++;
+          }
+        }
+      }
+
+      totalPulled += cloudCustomers.length;
+      offset += PULL_BATCH_SIZE;
+      hasMore = cloudCustomers.length === PULL_BATCH_SIZE;
+
+      this.updateProgress({ 
+        message: `Downloaded ${totalPulled} customers...`,
+        processedRecords: this.currentProgress.processedRecords + cloudCustomers.length
+      });
     }
     
+    console.log(`[Sync] Customer pull complete: ${totalPulled} fetched, ${count} added/updated`);
+    
     if (count > 0) {
-      await this.addSyncLog('pull', 'customers', count, 'success', `Pulled ${count} customers`);
+      await this.addSyncLog('pull', 'customers', count, 'success', `Pulled ${totalPulled} customers (${count} new/updated)`);
     }
   }
 
@@ -1439,148 +1484,316 @@ class SyncService {
   }
 
   private async pullExpenses() {
-    const { data: cloudExpenses, error } = await supabase.from('expenses').select('*');
-    
-    if (error || !cloudExpenses) return;
-
+    const PULL_BATCH_SIZE = 1000;
+    let offset = 0;
+    let hasMore = true;
+    let totalPulled = 0;
     let count = 0;
-    for (const cloud of cloudExpenses) {
-      const existingExpense = await db.expenses
-        .where('date')
-        .equals(new Date(cloud.date))
-        .filter(e => e.amount === Number(cloud.amount) && e.category === cloud.category)
-        .first();
-      
-      if (!existingExpense) {
-        await db.expenses.add({
-          category: cloud.category,
-          description: cloud.description || '',
-          amount: Number(cloud.amount),
-          date: new Date(cloud.date),
-          paymentMethod: (cloud.payment_method || 'cash') as 'cash' | 'card',
-          expenseType: (cloud.expense_type || 'business') as 'business' | 'personal',
-          receipt: cloud.receipt || undefined,
-          createdBy: cloud.created_by,
-          createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date()
-        });
-        count++;
+
+    console.log('[Sync] Starting paginated expense pull...');
+    this.updateProgress({ currentTable: 'expenses', message: 'Downloading expenses...' });
+
+    while (hasMore) {
+      const { data: cloudExpenses, error } = await supabase
+        .from('expenses')
+        .select('*')
+        .range(offset, offset + PULL_BATCH_SIZE - 1)
+        .order('created_at', { ascending: true });
+
+      if (error || !cloudExpenses || cloudExpenses.length === 0) {
+        hasMore = false;
+        break;
       }
-    }
-    
-    if (count > 0) {
-      await this.addSyncLog('pull', 'expenses', count, 'success', `Pulled ${count} expenses`);
-    }
-  }
 
-  private async pullCashiers() {
-    const { data: cloudCashiers, error } = await supabase.from('cashiers').select('*');
-    
-    if (error || !cloudCashiers) return;
-
-    let count = 0;
-    for (const cloud of cloudCashiers) {
-      const localCashier = await db.cashiers.where('name').equals(cloud.name).first();
-      
-      if (!localCashier) {
-        await db.cashiers.add({
-          name: cloud.name,
-          pin: cloud.pin,
-          role: cloud.role as any,
-          createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date()
-        });
-        count++;
-      } else {
-        const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
-        const localUpdatedAt = localCashier.createdAt || new Date(0);
+      for (const cloud of cloudExpenses) {
+        const existingExpense = await db.expenses
+          .where('date')
+          .equals(new Date(cloud.date))
+          .filter(e => e.amount === Number(cloud.amount) && e.category === cloud.category)
+          .first();
         
-        if (cloudUpdatedAt > localUpdatedAt) {
-          await db.cashiers.update(localCashier.id!, {
-            pin: cloud.pin,
-            role: cloud.role as any
+        if (!existingExpense) {
+          await db.expenses.add({
+            category: cloud.category,
+            description: cloud.description || '',
+            amount: Number(cloud.amount),
+            date: new Date(cloud.date),
+            paymentMethod: (cloud.payment_method || 'cash') as 'cash' | 'card',
+            expenseType: (cloud.expense_type || 'business') as 'business' | 'personal',
+            receipt: cloud.receipt || undefined,
+            createdBy: cloud.created_by,
+            createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date()
           });
           count++;
         }
       }
+
+      totalPulled += cloudExpenses.length;
+      offset += PULL_BATCH_SIZE;
+      hasMore = cloudExpenses.length === PULL_BATCH_SIZE;
+
+      this.updateProgress({ 
+        message: `Downloaded ${totalPulled} expenses...`,
+        processedRecords: this.currentProgress.processedRecords + cloudExpenses.length
+      });
     }
     
+    console.log(`[Sync] Expense pull complete: ${totalPulled} fetched, ${count} added`);
+    
     if (count > 0) {
-      await this.addSyncLog('pull', 'cashiers', count, 'success', `Pulled ${count} cashiers`);
+      await this.addSyncLog('pull', 'expenses', count, 'success', `Pulled ${totalPulled} expenses (${count} new)`);
+    }
+  }
+
+  private async pullCashiers() {
+    const PULL_BATCH_SIZE = 1000;
+    let offset = 0;
+    let hasMore = true;
+    let totalPulled = 0;
+    let count = 0;
+
+    console.log('[Sync] Starting paginated cashier pull...');
+    this.updateProgress({ currentTable: 'cashiers', message: 'Downloading cashiers...' });
+
+    while (hasMore) {
+      const { data: cloudCashiers, error } = await supabase
+        .from('cashiers')
+        .select('*')
+        .range(offset, offset + PULL_BATCH_SIZE - 1)
+        .order('created_at', { ascending: true });
+
+      if (error || !cloudCashiers || cloudCashiers.length === 0) {
+        hasMore = false;
+        break;
+      }
+
+      for (const cloud of cloudCashiers) {
+        const localCashier = await db.cashiers.where('name').equals(cloud.name).first();
+        
+        if (!localCashier) {
+          await db.cashiers.add({
+            name: cloud.name,
+            pin: cloud.pin,
+            role: cloud.role as any,
+            createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date()
+          });
+          count++;
+        } else {
+          const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
+          const localUpdatedAt = localCashier.createdAt || new Date(0);
+          
+          if (cloudUpdatedAt > localUpdatedAt) {
+            await db.cashiers.update(localCashier.id!, {
+              pin: cloud.pin,
+              role: cloud.role as any
+            });
+            count++;
+          }
+        }
+      }
+
+      totalPulled += cloudCashiers.length;
+      offset += PULL_BATCH_SIZE;
+      hasMore = cloudCashiers.length === PULL_BATCH_SIZE;
+
+      this.updateProgress({ 
+        message: `Downloaded ${totalPulled} cashiers...`,
+        processedRecords: this.currentProgress.processedRecords + cloudCashiers.length
+      });
+    }
+    
+    console.log(`[Sync] Cashier pull complete: ${totalPulled} fetched, ${count} added/updated`);
+    
+    if (count > 0) {
+      await this.addSyncLog('pull', 'cashiers', count, 'success', `Pulled ${totalPulled} cashiers (${count} new/updated)`);
     }
   }
 
   private async pullCategories() {
-    const { data: cloudCategories, error } = await supabase.from('categories').select('*');
-    
-    if (error || !cloudCategories) return;
-
+    const PULL_BATCH_SIZE = 1000;
+    let offset = 0;
+    let hasMore = true;
+    let totalPulled = 0;
     let count = 0;
-    for (const cloud of cloudCategories) {
-      const localCategory = await db.categories.where('name').equals(cloud.name).first();
-      if (!localCategory) {
-        await db.categories.add({ name: cloud.name });
-        count++;
+
+    console.log('[Sync] Starting paginated category pull...');
+    this.updateProgress({ currentTable: 'categories', message: 'Downloading categories...' });
+
+    while (hasMore) {
+      const { data: cloudCategories, error } = await supabase
+        .from('categories')
+        .select('*')
+        .range(offset, offset + PULL_BATCH_SIZE - 1)
+        .order('created_at', { ascending: true });
+
+      if (error || !cloudCategories || cloudCategories.length === 0) {
+        hasMore = false;
+        break;
       }
+
+      for (const cloud of cloudCategories) {
+        const localCategory = await db.categories.where('name').equals(cloud.name).first();
+        if (!localCategory) {
+          await db.categories.add({ name: cloud.name });
+          count++;
+        }
+      }
+
+      totalPulled += cloudCategories.length;
+      offset += PULL_BATCH_SIZE;
+      hasMore = cloudCategories.length === PULL_BATCH_SIZE;
+
+      this.updateProgress({ 
+        message: `Downloaded ${totalPulled} categories...`,
+        processedRecords: this.currentProgress.processedRecords + cloudCategories.length
+      });
     }
     
+    console.log(`[Sync] Category pull complete: ${totalPulled} fetched, ${count} added`);
+    
     if (count > 0) {
-      await this.addSyncLog('pull', 'categories', count, 'success', `Pulled ${count} categories`);
+      await this.addSyncLog('pull', 'categories', count, 'success', `Pulled ${totalPulled} categories (${count} new)`);
     }
   }
 
   private async pullSuppliers() {
-    const { data: cloudSuppliers, error } = await supabase.from('suppliers').select('*');
-    
-    if (error || !cloudSuppliers) return;
-
+    const PULL_BATCH_SIZE = 1000;
+    let offset = 0;
+    let hasMore = true;
+    let totalPulled = 0;
     let count = 0;
-    for (const cloud of cloudSuppliers) {
-      const localSupplier = await db.suppliers.where('name').equals(cloud.name).first();
-      if (!localSupplier) {
-        await db.suppliers.add({ name: cloud.name, contact: cloud.contact || undefined });
-        count++;
+
+    console.log('[Sync] Starting paginated supplier pull...');
+    this.updateProgress({ currentTable: 'suppliers', message: 'Downloading suppliers...' });
+
+    while (hasMore) {
+      const { data: cloudSuppliers, error } = await supabase
+        .from('suppliers')
+        .select('*')
+        .range(offset, offset + PULL_BATCH_SIZE - 1)
+        .order('created_at', { ascending: true });
+
+      if (error || !cloudSuppliers || cloudSuppliers.length === 0) {
+        hasMore = false;
+        break;
       }
+
+      for (const cloud of cloudSuppliers) {
+        const localSupplier = await db.suppliers.where('name').equals(cloud.name).first();
+        if (!localSupplier) {
+          await db.suppliers.add({ name: cloud.name, contact: cloud.contact || undefined });
+          count++;
+        }
+      }
+
+      totalPulled += cloudSuppliers.length;
+      offset += PULL_BATCH_SIZE;
+      hasMore = cloudSuppliers.length === PULL_BATCH_SIZE;
+
+      this.updateProgress({ 
+        message: `Downloaded ${totalPulled} suppliers...`,
+        processedRecords: this.currentProgress.processedRecords + cloudSuppliers.length
+      });
     }
     
+    console.log(`[Sync] Supplier pull complete: ${totalPulled} fetched, ${count} added`);
+    
     if (count > 0) {
-      await this.addSyncLog('pull', 'suppliers', count, 'success', `Pulled ${count} suppliers`);
+      await this.addSyncLog('pull', 'suppliers', count, 'success', `Pulled ${totalPulled} suppliers (${count} new)`);
     }
   }
 
   private async pullUnits() {
-    const { data: cloudUnits, error } = await supabase.from('units').select('*');
-    
-    if (error || !cloudUnits) return;
-
+    const PULL_BATCH_SIZE = 1000;
+    let offset = 0;
+    let hasMore = true;
+    let totalPulled = 0;
     let count = 0;
-    for (const cloud of cloudUnits) {
-      const localUnit = await db.units.where('name').equals(cloud.name).first();
-      if (!localUnit) {
-        await db.units.add({ name: cloud.name, symbol: cloud.symbol });
-        count++;
+
+    console.log('[Sync] Starting paginated unit pull...');
+    this.updateProgress({ currentTable: 'units', message: 'Downloading units...' });
+
+    while (hasMore) {
+      const { data: cloudUnits, error } = await supabase
+        .from('units')
+        .select('*')
+        .range(offset, offset + PULL_BATCH_SIZE - 1)
+        .order('created_at', { ascending: true });
+
+      if (error || !cloudUnits || cloudUnits.length === 0) {
+        hasMore = false;
+        break;
       }
+
+      for (const cloud of cloudUnits) {
+        const localUnit = await db.units.where('name').equals(cloud.name).first();
+        if (!localUnit) {
+          await db.units.add({ name: cloud.name, symbol: cloud.symbol });
+          count++;
+        }
+      }
+
+      totalPulled += cloudUnits.length;
+      offset += PULL_BATCH_SIZE;
+      hasMore = cloudUnits.length === PULL_BATCH_SIZE;
+
+      this.updateProgress({ 
+        message: `Downloaded ${totalPulled} units...`,
+        processedRecords: this.currentProgress.processedRecords + cloudUnits.length
+      });
     }
     
+    console.log(`[Sync] Unit pull complete: ${totalPulled} fetched, ${count} added`);
+    
     if (count > 0) {
-      await this.addSyncLog('pull', 'units', count, 'success', `Pulled ${count} units`);
+      await this.addSyncLog('pull', 'units', count, 'success', `Pulled ${totalPulled} units (${count} new)`);
     }
   }
 
   private async pullQuickQuantities() {
-    const { data: cloudQtys, error } = await supabase.from('quick_quantities').select('*');
-    
-    if (error || !cloudQtys) return;
-
+    const PULL_BATCH_SIZE = 1000;
+    let offset = 0;
+    let hasMore = true;
+    let totalPulled = 0;
     let count = 0;
-    for (const cloud of cloudQtys) {
-      const localQty = await db.quickQuantities.where('label').equals(cloud.label).first();
-      if (!localQty) {
-        await db.quickQuantities.add({ value: Number(cloud.value), label: cloud.label });
-        count++;
+
+    console.log('[Sync] Starting paginated quick quantities pull...');
+    this.updateProgress({ currentTable: 'quick_quantities', message: 'Downloading quick quantities...' });
+
+    while (hasMore) {
+      const { data: cloudQtys, error } = await supabase
+        .from('quick_quantities')
+        .select('*')
+        .range(offset, offset + PULL_BATCH_SIZE - 1)
+        .order('created_at', { ascending: true });
+
+      if (error || !cloudQtys || cloudQtys.length === 0) {
+        hasMore = false;
+        break;
       }
+
+      for (const cloud of cloudQtys) {
+        const localQty = await db.quickQuantities.where('label').equals(cloud.label).first();
+        if (!localQty) {
+          await db.quickQuantities.add({ value: Number(cloud.value), label: cloud.label });
+          count++;
+        }
+      }
+
+      totalPulled += cloudQtys.length;
+      offset += PULL_BATCH_SIZE;
+      hasMore = cloudQtys.length === PULL_BATCH_SIZE;
+
+      this.updateProgress({ 
+        message: `Downloaded ${totalPulled} quick quantities...`,
+        processedRecords: this.currentProgress.processedRecords + cloudQtys.length
+      });
     }
     
+    console.log(`[Sync] Quick quantities pull complete: ${totalPulled} fetched, ${count} added`);
+    
     if (count > 0) {
-      await this.addSyncLog('pull', 'quick_quantities', count, 'success', `Pulled ${count} quick quantities`);
+      await this.addSyncLog('pull', 'quick_quantities', count, 'success', `Pulled ${totalPulled} quick quantities (${count} new)`);
     }
   }
 
