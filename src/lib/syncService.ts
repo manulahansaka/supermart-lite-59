@@ -272,6 +272,16 @@ class SyncService {
       const local = await db.products.where('barcode').equals(oldRecord.barcode).first();
       if (local) await db.products.delete(local.id!);
     } else if (newRecord) {
+      // Check if product was soft-deleted - remove locally if so
+      if (newRecord.deleted_at) {
+        const local = await db.products.where('barcode').equals(newRecord.barcode).first();
+        if (local) {
+          await db.products.delete(local.id!);
+          console.log(`[Sync] Product ${newRecord.barcode} was soft-deleted, removed locally`);
+        }
+        return;
+      }
+      
       const local = await db.products.where('barcode').equals(newRecord.barcode).first();
       const productData = {
         barcode: newRecord.barcode,
@@ -304,6 +314,16 @@ class SyncService {
       const local = await db.customers.where('phone').equals(oldRecord.phone).first();
       if (local) await db.customers.delete(local.id!);
     } else if (newRecord) {
+      // Check if customer was soft-deleted - remove locally if so
+      if (newRecord.deleted_at) {
+        const local = await db.customers.where('phone').equals(newRecord.phone).first();
+        if (local) {
+          await db.customers.delete(local.id!);
+          console.log(`[Sync] Customer ${newRecord.phone} was soft-deleted, removed locally`);
+        }
+        return;
+      }
+      
       const local = await db.customers.where('phone').equals(newRecord.phone).first();
       const customerData = {
         name: newRecord.name,
@@ -366,6 +386,16 @@ class SyncService {
       const local = await db.cashiers.where('name').equals(oldRecord.name).first();
       if (local) await db.cashiers.delete(local.id!);
     } else if (newRecord) {
+      // Check if cashier was soft-deleted - remove locally if so
+      if (newRecord.deleted_at) {
+        const local = await db.cashiers.where('name').equals(newRecord.name).first();
+        if (local) {
+          await db.cashiers.delete(local.id!);
+          console.log(`[Sync] Cashier ${newRecord.name} was soft-deleted, removed locally`);
+        }
+        return;
+      }
+      
       const local = await db.cashiers.where('name').equals(newRecord.name).first();
       const cashierData = {
         name: newRecord.name,
@@ -791,9 +821,36 @@ class SyncService {
     await this.addSyncLog('push', 'all', processedRecords, 'success', `Delta sync: ${processedRecords} records processed`);
   }
 
-  // Batch push methods
+  // Batch push methods - with soft-delete conflict detection
   private async pushProductsBatch(products: Product[], startIndex: number = 0) {
-    const batches = this.createBatches(products.slice(startIndex), BATCH_SIZE);
+    // First, check which products are soft-deleted in cloud to avoid re-uploading them
+    const barcodes = products.map(p => p.barcode);
+    const { data: deletedProducts } = await supabase
+      .from('products')
+      .select('barcode')
+      .in('barcode', barcodes)
+      .not('deleted_at', 'is', null);
+    
+    const deletedBarcodes = new Set(deletedProducts?.map(p => p.barcode) || []);
+    
+    // Filter out products that were soft-deleted in cloud
+    const productsToSync = products.filter(p => !deletedBarcodes.has(p.barcode));
+    
+    // Remove locally any products that are deleted in cloud
+    for (const barcode of deletedBarcodes) {
+      const localProduct = await db.products.where('barcode').equals(barcode).first();
+      if (localProduct) {
+        await db.products.delete(localProduct.id!);
+        console.log(`[Sync] Removed locally: product ${barcode} was deleted on another device`);
+      }
+    }
+    
+    if (productsToSync.length === 0) {
+      console.log('[Sync] No products to push (all were soft-deleted)');
+      return;
+    }
+    
+    const batches = this.createBatches(productsToSync.slice(startIndex), BATCH_SIZE);
     
     for (let i = 0; i < batches.length; i++) {
       const batch = batches[i];
@@ -815,7 +872,8 @@ class SyncService {
         discount_percent: p.discountPercent || undefined,
         discount_start_date: p.discountStartDate ? toISOString(p.discountStartDate) : undefined,
         discount_end_date: p.discountEndDate ? toISOString(p.discountEndDate) : undefined,
-        updated_at: toISOString(p.updatedAt)
+        updated_at: toISOString(p.updatedAt),
+        deleted_at: null  // Ensure we're not pushing as deleted
       }));
 
       const { error } = await supabase.from('products').upsert(records, { onConflict: 'barcode' });
@@ -831,7 +889,7 @@ class SyncService {
       });
     }
     
-    await this.addSyncLog('push', 'products', products.length, 'success', `Batch pushed ${products.length} products`);
+    await this.addSyncLog('push', 'products', productsToSync.length, 'success', `Batch pushed ${productsToSync.length} products (${deletedBarcodes.size} skipped as deleted)`);
   }
 
   private async pushCustomersBatch(customers: Customer[]) {
@@ -1053,26 +1111,36 @@ class SyncService {
     await this.pushCashiersBatch([cashier]);
   }
 
-  // Delete methods
+  // Delete methods - using soft delete with deleted_at timestamp
   async deleteProductFromCloud(barcode: string) {
     if (!this.isOnline) return;
     try {
-      const { error } = await supabase.from('products').delete().eq('barcode', barcode);
+      // Soft delete: set deleted_at timestamp instead of hard delete
+      const { error } = await supabase
+        .from('products')
+        .update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('barcode', barcode);
       if (error) throw error;
-      await this.addSyncLog('push', 'products', 1, 'success', `Product deleted from cloud`);
+      await this.addSyncLog('push', 'products', 1, 'success', `Product soft-deleted from cloud: ${barcode}`);
+      console.log(`[Sync] Product ${barcode} soft-deleted`);
     } catch (error) {
-      console.error('[Sync] Error deleting product from cloud:', error);
+      console.error('[Sync] Error soft-deleting product from cloud:', error);
     }
   }
 
   async deleteCustomerFromCloud(phone: string) {
     if (!this.isOnline) return;
     try {
-      const { error } = await supabase.from('customers').delete().eq('phone', phone);
+      // Soft delete: set deleted_at timestamp instead of hard delete
+      const { error } = await supabase
+        .from('customers')
+        .update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('phone', phone);
       if (error) throw error;
-      await this.addSyncLog('push', 'customers', 1, 'success', `Customer deleted from cloud`);
+      await this.addSyncLog('push', 'customers', 1, 'success', `Customer soft-deleted from cloud: ${phone}`);
+      console.log(`[Sync] Customer ${phone} soft-deleted`);
     } catch (error) {
-      console.error('[Sync] Error deleting customer from cloud:', error);
+      console.error('[Sync] Error soft-deleting customer from cloud:', error);
     }
   }
 
@@ -1099,10 +1167,15 @@ class SyncService {
   async deleteCashierFromCloud(name: string) {
     if (!this.isOnline) return;
     try {
-      const { error } = await supabase.from('cashiers').delete().eq('name', name);
+      // Soft delete: set deleted_at timestamp instead of hard delete
+      const { error } = await supabase
+        .from('cashiers')
+        .update({ deleted_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+        .eq('name', name);
       if (error) throw error;
+      console.log(`[Sync] Cashier ${name} soft-deleted`);
     } catch (error) {
-      console.error('[Sync] Error deleting cashier from cloud:', error);
+      console.error('[Sync] Error soft-deleting cashier from cloud:', error);
     }
   }
 
@@ -1171,31 +1244,88 @@ class SyncService {
   async clearAllCloudData() {
     if (!this.isOnline) return;
     
-    console.log('[Sync] Clearing ALL cloud data...');
+    console.log('[Sync] Clearing ALL cloud data with batch deletion...');
+    
+    // Pause realtime and auto-sync during restore
+    this.cleanupRealtimeSubscriptions();
+    if (this.autoSyncInterval) {
+      clearInterval(this.autoSyncInterval);
+      this.autoSyncInterval = null;
+    }
     
     try {
-      // Delete in order to avoid foreign key issues
-      await supabase.from('sales').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      await supabase.from('expenses').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      await supabase.from('products').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      await supabase.from('customers').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      await supabase.from('cashiers').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      await supabase.from('categories').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      await supabase.from('suppliers').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      await supabase.from('units').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      await supabase.from('quick_quantities').delete().neq('id', '00000000-0000-0000-0000-000000000000');
-      await supabase.from('settings').delete().neq('id', '00000000-0000-0000-0000-000000000000');
+      // Delete each table in batches
+      await this.clearTableInBatches('sales');
+      await this.clearTableInBatches('expenses');
+      await this.clearTableInBatches('products');
+      await this.clearTableInBatches('customers');
+      await this.clearTableInBatches('cashiers');
+      await this.clearTableInBatches('categories');
+      await this.clearTableInBatches('suppliers');
+      await this.clearTableInBatches('units');
+      await this.clearTableInBatches('quick_quantities');
+      await this.clearTableInBatches('settings');
       
       // Clear sync timestamps to force full re-sync later
       localStorage.removeItem(LAST_SYNC_TIMESTAMPS_KEY);
       localStorage.removeItem(SYNC_CHECKPOINT_KEY);
+      localStorage.removeItem('last_sync_time');
       
-      await this.addSyncLog('push', 'all', 0, 'success', 'All cloud data cleared');
+      await this.addSyncLog('push', 'all', 0, 'success', 'All cloud data cleared with batch deletion');
       console.log('[Sync] All cloud data cleared successfully');
+      
+      // Restart auto-sync
+      this.startAutoSync();
     } catch (error) {
       console.error('[Sync] Error clearing cloud data:', error);
       await this.addSyncLog('push', 'all', 0, 'error', `Failed to clear cloud data: ${error}`);
+      // Restart auto-sync even on error
+      this.startAutoSync();
       throw error;
+    }
+  }
+
+  private async clearTableInBatches(tableName: 'sales' | 'expenses' | 'products' | 'customers' | 'cashiers' | 'categories' | 'suppliers' | 'units' | 'quick_quantities' | 'settings') {
+    console.log(`[Sync] Clearing ${tableName}...`);
+    let deletedCount = 0;
+    let hasMore = true;
+    
+    while (hasMore) {
+      // Get batch of IDs to delete
+      const { data: batch, error: selectError } = await supabase
+        .from(tableName)
+        .select('id')
+        .limit(1000);
+      
+      if (selectError) {
+        console.error(`[Sync] Error selecting ${tableName}:`, selectError);
+        break;
+      }
+      
+      if (!batch || batch.length === 0) {
+        hasMore = false;
+        break;
+      }
+      
+      const ids = batch.map(r => r.id);
+      const { error: deleteError } = await supabase
+        .from(tableName)
+        .delete()
+        .in('id', ids);
+      
+      if (deleteError) {
+        console.error(`[Sync] Error deleting ${tableName} batch:`, deleteError);
+        break;
+      }
+      
+      deletedCount += ids.length;
+      console.log(`[Sync] Deleted ${deletedCount} records from ${tableName}`);
+      
+      // Safety limit
+      if (deletedCount > 100000) {
+        console.warn(`[Sync] Reached safety limit for ${tableName}`);
+        break;
+      }
     }
   }
 
@@ -1265,11 +1395,13 @@ class SyncService {
     let hasMore = true;
     let totalPulled = 0;
     let totalUpdated = 0;
+    let totalDeleted = 0;
 
-    console.log('[Sync] Starting paginated product pull...');
+    console.log('[Sync] Starting paginated product pull (with soft-delete support)...');
     this.updateProgress({ currentTable: 'products', message: 'Downloading products...' });
 
     while (hasMore) {
+      // Fetch all products including soft-deleted to handle removals
       const { data: cloudProducts, error } = await supabase
         .from('products')
         .select('*')
@@ -1290,6 +1422,16 @@ class SyncService {
 
       for (const cloud of cloudProducts) {
         const localProduct = await db.products.where('barcode').equals(cloud.barcode).first();
+        
+        // Handle soft-deleted products - remove locally if deleted in cloud
+        if (cloud.deleted_at) {
+          if (localProduct) {
+            await db.products.delete(localProduct.id!);
+            totalDeleted++;
+            console.log(`[Sync] Removed soft-deleted product locally: ${cloud.barcode}`);
+          }
+          continue; // Skip adding/updating deleted products
+        }
         
         if (!localProduct) {
           await db.products.add({
@@ -1376,6 +1518,15 @@ class SyncService {
 
       for (const cloud of cloudCustomers) {
         const localCustomer = await db.customers.where('phone').equals(cloud.phone).first();
+        
+        // Handle soft-deleted customers - remove locally if deleted in cloud
+        if (cloud.deleted_at) {
+          if (localCustomer) {
+            await db.customers.delete(localCustomer.id!);
+            console.log(`[Sync] Removed soft-deleted customer locally: ${cloud.phone}`);
+          }
+          continue;
+        }
         
         if (!localCustomer) {
           await db.customers.add({

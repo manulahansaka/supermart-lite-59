@@ -17,6 +17,7 @@ export type Database = {
       cashiers: {
         Row: {
           created_at: string | null
+          deleted_at: string | null
           device_id: string | null
           id: string
           local_id: number | null
@@ -28,6 +29,7 @@ export type Database = {
         }
         Insert: {
           created_at?: string | null
+          deleted_at?: string | null
           device_id?: string | null
           id?: string
           local_id?: number | null
@@ -39,6 +41,7 @@ export type Database = {
         }
         Update: {
           created_at?: string | null
+          deleted_at?: string | null
           device_id?: string | null
           id?: string
           local_id?: number | null
@@ -74,6 +77,7 @@ export type Database = {
       customers: {
         Row: {
           created_at: string | null
+          deleted_at: string | null
           device_id: string | null
           email: string | null
           id: string
@@ -90,6 +94,7 @@ export type Database = {
         }
         Insert: {
           created_at?: string | null
+          deleted_at?: string | null
           device_id?: string | null
           email?: string | null
           id?: string
@@ -106,6 +111,7 @@ export type Database = {
         }
         Update: {
           created_at?: string | null
+          deleted_at?: string | null
           device_id?: string | null
           email?: string | null
           id?: string
@@ -129,6 +135,7 @@ export type Database = {
           created_at: string | null
           created_by: string
           date: string
+          deleted_at: string | null
           description: string | null
           device_id: string | null
           expense_type: string | null
@@ -144,6 +151,7 @@ export type Database = {
           created_at?: string | null
           created_by: string
           date: string
+          deleted_at?: string | null
           description?: string | null
           device_id?: string | null
           expense_type?: string | null
@@ -159,6 +167,7 @@ export type Database = {
           created_at?: string | null
           created_by?: string
           date?: string
+          deleted_at?: string | null
           description?: string | null
           device_id?: string | null
           expense_type?: string | null
@@ -176,6 +185,7 @@ export type Database = {
           category: string | null
           cost_price: number
           created_at: string | null
+          deleted_at: string | null
           device_id: string | null
           discount_end_date: string | null
           discount_percent: number | null
@@ -197,6 +207,7 @@ export type Database = {
           category?: string | null
           cost_price: number
           created_at?: string | null
+          deleted_at?: string | null
           device_id?: string | null
           discount_end_date?: string | null
           discount_percent?: number | null
@@ -218,6 +229,7 @@ export type Database = {
           category?: string | null
           cost_price?: number
           created_at?: string | null
+          deleted_at?: string | null
           device_id?: string | null
           discount_end_date?: string | null
           discount_percent?: number | null
