@@ -78,8 +78,14 @@ export const SystemRestore = ({ compact = false }: SystemRestoreProps) => {
 
       if (isFullRestore) {
         // FULL RESTORE: Clear ALL local and cloud data
+        setRestoreMessage('Pausing sync operations...');
+        setRestoreProgress(5);
+        
+        // Pause sync to prevent data from coming back
+        syncService.pauseSync();
+        
         setRestoreMessage('Clearing all local data...');
-        setRestoreProgress(10);
+        setRestoreProgress(15);
 
         // Clear all local tables
         await db.transaction('rw', [db.sales, db.products, db.expenses, db.customers, db.cashiers, db.categories, db.suppliers, db.units, db.quickQuantities, db.syncLogs], async () => {
@@ -100,19 +106,23 @@ export const SystemRestore = ({ compact = false }: SystemRestoreProps) => {
           await db.syncLogs.clear();
         });
 
-        setRestoreMessage('Clearing all cloud data...');
-        setRestoreProgress(50);
+        setRestoreMessage('Clearing all cloud data (this may take a while)...');
+        setRestoreProgress(40);
 
         // Clear all cloud data
         await syncService.clearAllCloudData();
 
-        setRestoreProgress(90);
-        setRestoreMessage('Finalizing...');
+        setRestoreProgress(85);
+        setRestoreMessage('Clearing sync timestamps...');
 
-        // Clear sync-related localStorage
-        localStorage.removeItem('last_sync_time');
-        localStorage.removeItem('last_sync_timestamps');
-        localStorage.removeItem('sync_checkpoint');
+        // Clear sync-related localStorage (already done in clearAllCloudData but ensure it's done)
+        syncService.clearAllSyncTimestamps();
+
+        setRestoreProgress(95);
+        setRestoreMessage('Resuming sync...');
+        
+        // Resume sync
+        syncService.resumeSync();
 
         setRestoreProgress(100);
         setRestoreMessage('Complete!');
