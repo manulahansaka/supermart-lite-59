@@ -7,7 +7,7 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/hooks/use-toast';
-import { Save, Plus, Trash2, UserPlus, KeyRound } from 'lucide-react';
+import { Save, Plus, Trash2, UserPlus, KeyRound, RefreshCw, Loader2, AlertTriangle } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -48,6 +48,8 @@ const Settings = () => {
   const [newAdminPassword, setNewAdminPassword] = useState('');
   const [isPasswordDialogOpen, setIsPasswordDialogOpen] = useState(false);
   const [currentUserRole, setCurrentUserRole] = useState<'super_admin' | 'admin' | 'cashier'>('cashier');
+  const [isResyncing, setIsResyncing] = useState(false);
+  const [resyncProgress, setResyncProgress] = useState('');
 
   useEffect(() => {
     const cashierStr = localStorage.getItem('cashier');
@@ -679,6 +681,98 @@ const Settings = () => {
                 </div>
               </DialogContent>
             </Dialog>
+          </CardContent>
+        </Card>
+
+        {/* Force Re-sync Card */}
+        <Card className="border-orange-500/50">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2 text-orange-600">
+              <RefreshCw className="h-5 w-5" />
+              Data Synchronization
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              If you're experiencing data inconsistencies between devices, you can force a full re-sync 
+              which will clear all local data and re-download everything from the cloud.
+            </p>
+            
+            {isResyncing && (
+              <div className="p-3 bg-muted rounded-lg text-sm text-center">
+                {resyncProgress}
+              </div>
+            )}
+            
+            <Button 
+              variant="outline"
+              className="w-full border-orange-500/50 text-orange-600 hover:bg-orange-50"
+              disabled={isResyncing}
+              onClick={async () => {
+                if (!confirm('This will clear all local data and re-download from cloud. Continue?')) return;
+                
+                setIsResyncing(true);
+                try {
+                  setResyncProgress('Pausing sync...');
+                  syncService.pauseSync();
+                  
+                  setResyncProgress('Clearing local data...');
+                  await db.transaction('rw', [db.sales, db.products, db.expenses, db.customers, db.cashiers, db.categories, db.suppliers, db.units, db.quickQuantities, db.syncLogs], async () => {
+                    await db.sales.clear();
+                    await db.expenses.clear();
+                    await db.products.clear();
+                    await db.customers.clear();
+                    // Keep super_admin cashier
+                    const superAdmin = await db.cashiers.where('role').equals('super_admin').first();
+                    await db.cashiers.clear();
+                    if (superAdmin) {
+                      await db.cashiers.add(superAdmin);
+                    }
+                    await db.categories.clear();
+                    await db.suppliers.clear();
+                    await db.units.clear();
+                    await db.quickQuantities.clear();
+                    await db.syncLogs.clear();
+                  });
+                  
+                  setResyncProgress('Clearing sync timestamps...');
+                  syncService.clearAllSyncTimestamps();
+                  
+                  setResyncProgress('Resuming sync and pulling from cloud...');
+                  syncService.resumeSync();
+                  
+                  await syncService.sync();
+                  
+                  toast({
+                    title: 'Re-sync Complete',
+                    description: 'All data has been refreshed from the cloud.',
+                  });
+                } catch (error) {
+                  console.error('Re-sync error:', error);
+                  toast({
+                    title: 'Error',
+                    description: 'Failed to re-sync. Please try again.',
+                    variant: 'destructive'
+                  });
+                  syncService.resumeSync();
+                } finally {
+                  setIsResyncing(false);
+                  setResyncProgress('');
+                }
+              }}
+            >
+              {isResyncing ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Re-syncing...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="mr-2 h-4 w-4" />
+                  Force Full Re-sync
+                </>
+              )}
+            </Button>
           </CardContent>
         </Card>
 

@@ -1247,11 +1247,7 @@ class SyncService {
     console.log('[Sync] Clearing ALL cloud data with batch deletion...');
     
     // Pause realtime and auto-sync during restore
-    this.cleanupRealtimeSubscriptions();
-    if (this.autoSyncInterval) {
-      clearInterval(this.autoSyncInterval);
-      this.autoSyncInterval = null;
-    }
+    this.pauseSync();
     
     try {
       // Delete each table in batches
@@ -1266,23 +1262,50 @@ class SyncService {
       await this.clearTableInBatches('quick_quantities');
       await this.clearTableInBatches('settings');
       
-      // Clear sync timestamps to force full re-sync later
-      localStorage.removeItem(LAST_SYNC_TIMESTAMPS_KEY);
-      localStorage.removeItem(SYNC_CHECKPOINT_KEY);
-      localStorage.removeItem('last_sync_time');
+      // Clear all sync timestamps
+      this.clearAllSyncTimestamps();
       
       await this.addSyncLog('push', 'all', 0, 'success', 'All cloud data cleared with batch deletion');
       console.log('[Sync] All cloud data cleared successfully');
       
-      // Restart auto-sync
-      this.startAutoSync();
+      // Resume sync
+      this.resumeSync();
     } catch (error) {
       console.error('[Sync] Error clearing cloud data:', error);
       await this.addSyncLog('push', 'all', 0, 'error', `Failed to clear cloud data: ${error}`);
-      // Restart auto-sync even on error
-      this.startAutoSync();
+      // Resume sync even on error
+      this.resumeSync();
       throw error;
     }
+  }
+
+  // Pause all sync operations
+  pauseSync() {
+    console.log('[Sync] Pausing sync operations...');
+    this.cleanupRealtimeSubscriptions();
+    this.stopFallbackPolling();
+    if (this.autoSyncInterval) {
+      clearInterval(this.autoSyncInterval);
+      this.autoSyncInterval = null;
+    }
+  }
+
+  // Resume all sync operations
+  resumeSync() {
+    console.log('[Sync] Resuming sync operations...');
+    this.startAutoSync();
+    if (this.realtimeEnabled && this.isOnline) {
+      this.setupRealtimeSubscriptions();
+    }
+  }
+
+  // Clear all sync timestamps to force full re-sync
+  clearAllSyncTimestamps() {
+    console.log('[Sync] Clearing all sync timestamps...');
+    localStorage.removeItem(LAST_SYNC_TIMESTAMPS_KEY);
+    localStorage.removeItem(SYNC_CHECKPOINT_KEY);
+    localStorage.removeItem('last_sync_time');
+    this.lastSyncTime = null;
   }
 
   private async clearTableInBatches(tableName: 'sales' | 'expenses' | 'products' | 'customers' | 'cashiers' | 'categories' | 'suppliers' | 'units' | 'quick_quantities' | 'settings') {
@@ -1393,15 +1416,16 @@ class SyncService {
     const PULL_BATCH_SIZE = 1000;
     let offset = 0;
     let hasMore = true;
-    let totalPulled = 0;
-    let totalUpdated = 0;
-    let totalDeleted = 0;
+    let stats = { created: 0, updated: 0, deleted: 0, orphansRemoved: 0 };
 
-    console.log('[Sync] Starting paginated product pull (with soft-delete support)...');
+    // Track ALL barcodes in cloud for orphan cleanup
+    const cloudBarcodes = new Set<string>();
+
+    console.log('[Sync] Starting full CRUD product pull with orphan cleanup...');
     this.updateProgress({ currentTable: 'products', message: 'Downloading products...' });
 
+    // Step 1: Pull ALL products from cloud (including soft-deleted)
     while (hasMore) {
-      // Fetch all products including soft-deleted to handle removals
       const { data: cloudProducts, error } = await supabase
         .from('products')
         .select('*')
@@ -1418,21 +1442,22 @@ class SyncService {
         break;
       }
 
-      console.log(`[Sync] Pulled products batch: ${offset}-${offset + cloudProducts.length} (${cloudProducts.length} items)`);
-
       for (const cloud of cloudProducts) {
+        // Track ALL cloud barcodes (even deleted ones for orphan detection)
+        cloudBarcodes.add(cloud.barcode);
+        
         const localProduct = await db.products.where('barcode').equals(cloud.barcode).first();
         
-        // Handle soft-deleted products - remove locally if deleted in cloud
+        // DELETE: Handle soft-deleted products - remove locally
         if (cloud.deleted_at) {
           if (localProduct) {
             await db.products.delete(localProduct.id!);
-            totalDeleted++;
-            console.log(`[Sync] Removed soft-deleted product locally: ${cloud.barcode}`);
+            stats.deleted++;
           }
-          continue; // Skip adding/updating deleted products
+          continue;
         }
         
+        // CREATE: New product in cloud → add locally
         if (!localProduct) {
           await db.products.add({
             barcode: cloud.barcode,
@@ -1451,46 +1476,58 @@ class SyncService {
             createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date(),
             updatedAt: cloud.updated_at ? new Date(cloud.updated_at) : new Date()
           });
-          totalUpdated++;
-        } else {
-          const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
-          const localUpdatedAt = localProduct.updatedAt || new Date(0);
-          
-          if (cloudUpdatedAt > localUpdatedAt) {
-            await db.products.update(localProduct.id!, {
-              name: cloud.name,
-              category: cloud.category || '',
-              costPrice: Number(cloud.cost_price),
-              sellingPrice: Number(cloud.selling_price),
-              stock: cloud.stock || 0,
-              minStock: cloud.min_stock || 0,
-              unit: cloud.unit || 'piece',
-              image: cloud.image || undefined,
-              supplier: cloud.supplier || undefined,
-              discountPercent: cloud.discount_percent ? Number(cloud.discount_percent) : undefined,
-              discountStartDate: cloud.discount_start_date ? new Date(cloud.discount_start_date) : undefined,
-              discountEndDate: cloud.discount_end_date ? new Date(cloud.discount_end_date) : undefined,
-              updatedAt: cloudUpdatedAt
-            });
-            totalUpdated++;
-          }
+          stats.created++;
+          continue;
+        }
+        
+        // UPDATE: Cloud version newer → update local
+        const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
+        const localUpdatedAt = localProduct.updatedAt || new Date(0);
+        
+        if (cloudUpdatedAt > localUpdatedAt) {
+          await db.products.update(localProduct.id!, {
+            name: cloud.name,
+            category: cloud.category || '',
+            costPrice: Number(cloud.cost_price),
+            sellingPrice: Number(cloud.selling_price),
+            stock: cloud.stock || 0,
+            minStock: cloud.min_stock || 0,
+            unit: cloud.unit || 'piece',
+            image: cloud.image || undefined,
+            supplier: cloud.supplier || undefined,
+            discountPercent: cloud.discount_percent ? Number(cloud.discount_percent) : undefined,
+            discountStartDate: cloud.discount_start_date ? new Date(cloud.discount_start_date) : undefined,
+            discountEndDate: cloud.discount_end_date ? new Date(cloud.discount_end_date) : undefined,
+            updatedAt: cloudUpdatedAt
+          });
+          stats.updated++;
         }
       }
 
-      totalPulled += cloudProducts.length;
       offset += PULL_BATCH_SIZE;
       hasMore = cloudProducts.length === PULL_BATCH_SIZE;
-
+      
       this.updateProgress({ 
-        message: `Downloaded ${totalPulled} products...`,
+        message: `Downloaded ${offset} products...`,
         processedRecords: this.currentProgress.processedRecords + cloudProducts.length
       });
     }
+
+    // Step 2: ORPHAN CLEANUP - Remove local products that don't exist in cloud
+    console.log('[Sync] Checking for orphan products...');
+    const allLocalProducts = await db.products.toArray();
     
-    console.log(`[Sync] Product pull complete: ${totalPulled} fetched, ${totalUpdated} added/updated`);
+    for (const local of allLocalProducts) {
+      if (!cloudBarcodes.has(local.barcode)) {
+        await db.products.delete(local.id!);
+        stats.orphansRemoved++;
+      }
+    }
+
+    console.log(`[Sync] Product pull complete: ${stats.created} created, ${stats.updated} updated, ${stats.deleted} soft-deleted, ${stats.orphansRemoved} orphans removed`);
     
-    if (totalUpdated > 0) {
-      await this.addSyncLog('pull', 'products', totalUpdated, 'success', `Pulled ${totalPulled} products (${totalUpdated} new/updated)`);
+    if (stats.created + stats.updated > 0) {
+      await this.addSyncLog('pull', 'products', stats.created + stats.updated, 'success', `Products: ${stats.created} created, ${stats.updated} updated, ${stats.orphansRemoved} orphans removed`);
     }
   }
 
@@ -1498,10 +1535,12 @@ class SyncService {
     const PULL_BATCH_SIZE = 1000;
     let offset = 0;
     let hasMore = true;
-    let totalPulled = 0;
-    let count = 0;
+    let stats = { created: 0, updated: 0, deleted: 0, orphansRemoved: 0 };
 
-    console.log('[Sync] Starting paginated customer pull...');
+    // Track ALL phones in cloud for orphan cleanup
+    const cloudPhones = new Set<string>();
+
+    console.log('[Sync] Starting full CRUD customer pull with orphan cleanup...');
     this.updateProgress({ currentTable: 'customers', message: 'Downloading customers...' });
 
     while (hasMore) {
@@ -1517,17 +1556,19 @@ class SyncService {
       }
 
       for (const cloud of cloudCustomers) {
+        cloudPhones.add(cloud.phone);
         const localCustomer = await db.customers.where('phone').equals(cloud.phone).first();
         
-        // Handle soft-deleted customers - remove locally if deleted in cloud
+        // DELETE: Handle soft-deleted customers
         if (cloud.deleted_at) {
           if (localCustomer) {
             await db.customers.delete(localCustomer.id!);
-            console.log(`[Sync] Removed soft-deleted customer locally: ${cloud.phone}`);
+            stats.deleted++;
           }
           continue;
         }
         
+        // CREATE: New customer in cloud
         if (!localCustomer) {
           await db.customers.add({
             name: cloud.name,
@@ -1540,41 +1581,50 @@ class SyncService {
             notes: cloud.notes || undefined,
             createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date()
           });
-          count++;
-        } else {
-          // Update existing customer if cloud version is newer
-          const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
-          const localUpdatedAt = localCustomer.createdAt || new Date(0);
-          
-          if (cloudUpdatedAt > localUpdatedAt) {
-            await db.customers.update(localCustomer.id!, {
-              name: cloud.name,
-              email: cloud.email || undefined,
-              loyaltyPoints: cloud.loyalty_points || 0,
-              totalPurchases: Number(cloud.total_purchases) || 0,
-              loanBalance: Number(cloud.loan_balance) || 0,
-              loanPurchases: (cloud.loan_purchases as any[]) || [],
-              notes: cloud.notes || undefined
-            });
-            count++;
-          }
+          stats.created++;
+          continue;
+        }
+        
+        // UPDATE: Cloud version newer
+        const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
+        const localUpdatedAt = localCustomer.createdAt || new Date(0);
+        
+        if (cloudUpdatedAt > localUpdatedAt) {
+          await db.customers.update(localCustomer.id!, {
+            name: cloud.name,
+            email: cloud.email || undefined,
+            loyaltyPoints: cloud.loyalty_points || 0,
+            totalPurchases: Number(cloud.total_purchases) || 0,
+            loanBalance: Number(cloud.loan_balance) || 0,
+            loanPurchases: (cloud.loan_purchases as any[]) || [],
+            notes: cloud.notes || undefined
+          });
+          stats.updated++;
         }
       }
 
-      totalPulled += cloudCustomers.length;
       offset += PULL_BATCH_SIZE;
       hasMore = cloudCustomers.length === PULL_BATCH_SIZE;
 
       this.updateProgress({ 
-        message: `Downloaded ${totalPulled} customers...`,
+        message: `Downloaded ${offset} customers...`,
         processedRecords: this.currentProgress.processedRecords + cloudCustomers.length
       });
     }
+
+    // ORPHAN CLEANUP
+    const allLocalCustomers = await db.customers.toArray();
+    for (const local of allLocalCustomers) {
+      if (!cloudPhones.has(local.phone)) {
+        await db.customers.delete(local.id!);
+        stats.orphansRemoved++;
+      }
+    }
     
-    console.log(`[Sync] Customer pull complete: ${totalPulled} fetched, ${count} added/updated`);
+    console.log(`[Sync] Customer pull complete: ${stats.created} created, ${stats.updated} updated, ${stats.deleted} soft-deleted, ${stats.orphansRemoved} orphans removed`);
     
-    if (count > 0) {
-      await this.addSyncLog('pull', 'customers', count, 'success', `Pulled ${totalPulled} customers (${count} new/updated)`);
+    if (stats.created + stats.updated > 0) {
+      await this.addSyncLog('pull', 'customers', stats.created + stats.updated, 'success', `Customers: ${stats.created} created, ${stats.updated} updated, ${stats.orphansRemoved} orphans removed`);
     }
   }
 
@@ -1700,10 +1750,12 @@ class SyncService {
     const PULL_BATCH_SIZE = 1000;
     let offset = 0;
     let hasMore = true;
-    let totalPulled = 0;
-    let count = 0;
+    let stats = { created: 0, updated: 0, deleted: 0, orphansRemoved: 0 };
 
-    console.log('[Sync] Starting paginated cashier pull...');
+    // Track ALL cashier names in cloud for orphan cleanup
+    const cloudNames = new Set<string>();
+
+    console.log('[Sync] Starting full CRUD cashier pull with orphan cleanup...');
     this.updateProgress({ currentTable: 'cashiers', message: 'Downloading cashiers...' });
 
     while (hasMore) {
@@ -1719,8 +1771,19 @@ class SyncService {
       }
 
       for (const cloud of cloudCashiers) {
+        cloudNames.add(cloud.name);
         const localCashier = await db.cashiers.where('name').equals(cloud.name).first();
         
+        // DELETE: Handle soft-deleted cashiers
+        if (cloud.deleted_at) {
+          if (localCashier) {
+            await db.cashiers.delete(localCashier.id!);
+            stats.deleted++;
+          }
+          continue;
+        }
+        
+        // CREATE: New cashier in cloud
         if (!localCashier) {
           await db.cashiers.add({
             name: cloud.name,
@@ -1728,35 +1791,45 @@ class SyncService {
             role: cloud.role as any,
             createdAt: cloud.created_at ? new Date(cloud.created_at) : new Date()
           });
-          count++;
-        } else {
-          const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
-          const localUpdatedAt = localCashier.createdAt || new Date(0);
-          
-          if (cloudUpdatedAt > localUpdatedAt) {
-            await db.cashiers.update(localCashier.id!, {
-              pin: cloud.pin,
-              role: cloud.role as any
-            });
-            count++;
-          }
+          stats.created++;
+          continue;
+        }
+        
+        // UPDATE: Cloud version newer
+        const cloudUpdatedAt = cloud.updated_at ? new Date(cloud.updated_at) : new Date(0);
+        const localUpdatedAt = localCashier.createdAt || new Date(0);
+        
+        if (cloudUpdatedAt > localUpdatedAt) {
+          await db.cashiers.update(localCashier.id!, {
+            pin: cloud.pin,
+            role: cloud.role as any
+          });
+          stats.updated++;
         }
       }
 
-      totalPulled += cloudCashiers.length;
       offset += PULL_BATCH_SIZE;
       hasMore = cloudCashiers.length === PULL_BATCH_SIZE;
 
       this.updateProgress({ 
-        message: `Downloaded ${totalPulled} cashiers...`,
+        message: `Downloaded ${offset} cashiers...`,
         processedRecords: this.currentProgress.processedRecords + cloudCashiers.length
       });
     }
     
-    console.log(`[Sync] Cashier pull complete: ${totalPulled} fetched, ${count} added/updated`);
+    // ORPHAN CLEANUP - but preserve super_admin if not in cloud
+    const allLocalCashiers = await db.cashiers.toArray();
+    for (const local of allLocalCashiers) {
+      if (!cloudNames.has(local.name) && local.role !== 'super_admin') {
+        await db.cashiers.delete(local.id!);
+        stats.orphansRemoved++;
+      }
+    }
     
-    if (count > 0) {
-      await this.addSyncLog('pull', 'cashiers', count, 'success', `Pulled ${totalPulled} cashiers (${count} new/updated)`);
+    console.log(`[Sync] Cashier pull complete: ${stats.created} created, ${stats.updated} updated, ${stats.deleted} soft-deleted, ${stats.orphansRemoved} orphans removed`);
+    
+    if (stats.created + stats.updated > 0) {
+      await this.addSyncLog('pull', 'cashiers', stats.created + stats.updated, 'success', `Cashiers: ${stats.created} created, ${stats.updated} updated, ${stats.orphansRemoved} orphans removed`);
     }
   }
 
@@ -1764,10 +1837,11 @@ class SyncService {
     const PULL_BATCH_SIZE = 1000;
     let offset = 0;
     let hasMore = true;
-    let totalPulled = 0;
-    let count = 0;
+    let stats = { created: 0, orphansRemoved: 0 };
 
-    console.log('[Sync] Starting paginated category pull...');
+    const cloudNames = new Set<string>();
+
+    console.log('[Sync] Starting full CRUD category pull with orphan cleanup...');
     this.updateProgress({ currentTable: 'categories', message: 'Downloading categories...' });
 
     while (hasMore) {
@@ -1783,27 +1857,36 @@ class SyncService {
       }
 
       for (const cloud of cloudCategories) {
+        cloudNames.add(cloud.name);
         const localCategory = await db.categories.where('name').equals(cloud.name).first();
         if (!localCategory) {
           await db.categories.add({ name: cloud.name });
-          count++;
+          stats.created++;
         }
       }
 
-      totalPulled += cloudCategories.length;
       offset += PULL_BATCH_SIZE;
       hasMore = cloudCategories.length === PULL_BATCH_SIZE;
 
       this.updateProgress({ 
-        message: `Downloaded ${totalPulled} categories...`,
+        message: `Downloaded ${offset} categories...`,
         processedRecords: this.currentProgress.processedRecords + cloudCategories.length
       });
     }
     
-    console.log(`[Sync] Category pull complete: ${totalPulled} fetched, ${count} added`);
+    // ORPHAN CLEANUP
+    const allLocalCategories = await db.categories.toArray();
+    for (const local of allLocalCategories) {
+      if (!cloudNames.has(local.name)) {
+        await db.categories.delete(local.id!);
+        stats.orphansRemoved++;
+      }
+    }
     
-    if (count > 0) {
-      await this.addSyncLog('pull', 'categories', count, 'success', `Pulled ${totalPulled} categories (${count} new)`);
+    console.log(`[Sync] Category pull complete: ${stats.created} created, ${stats.orphansRemoved} orphans removed`);
+    
+    if (stats.created > 0) {
+      await this.addSyncLog('pull', 'categories', stats.created, 'success', `Categories: ${stats.created} created, ${stats.orphansRemoved} orphans removed`);
     }
   }
 
@@ -1811,10 +1894,11 @@ class SyncService {
     const PULL_BATCH_SIZE = 1000;
     let offset = 0;
     let hasMore = true;
-    let totalPulled = 0;
-    let count = 0;
+    let stats = { created: 0, updated: 0, orphansRemoved: 0 };
 
-    console.log('[Sync] Starting paginated supplier pull...');
+    const cloudNames = new Set<string>();
+
+    console.log('[Sync] Starting full CRUD supplier pull with orphan cleanup...');
     this.updateProgress({ currentTable: 'suppliers', message: 'Downloading suppliers...' });
 
     while (hasMore) {
@@ -1830,27 +1914,39 @@ class SyncService {
       }
 
       for (const cloud of cloudSuppliers) {
+        cloudNames.add(cloud.name);
         const localSupplier = await db.suppliers.where('name').equals(cloud.name).first();
         if (!localSupplier) {
           await db.suppliers.add({ name: cloud.name, contact: cloud.contact || undefined });
-          count++;
+          stats.created++;
+        } else if (cloud.contact !== localSupplier.contact) {
+          await db.suppliers.update(localSupplier.id!, { contact: cloud.contact || undefined });
+          stats.updated++;
         }
       }
 
-      totalPulled += cloudSuppliers.length;
       offset += PULL_BATCH_SIZE;
       hasMore = cloudSuppliers.length === PULL_BATCH_SIZE;
 
       this.updateProgress({ 
-        message: `Downloaded ${totalPulled} suppliers...`,
+        message: `Downloaded ${offset} suppliers...`,
         processedRecords: this.currentProgress.processedRecords + cloudSuppliers.length
       });
     }
     
-    console.log(`[Sync] Supplier pull complete: ${totalPulled} fetched, ${count} added`);
+    // ORPHAN CLEANUP
+    const allLocalSuppliers = await db.suppliers.toArray();
+    for (const local of allLocalSuppliers) {
+      if (!cloudNames.has(local.name)) {
+        await db.suppliers.delete(local.id!);
+        stats.orphansRemoved++;
+      }
+    }
     
-    if (count > 0) {
-      await this.addSyncLog('pull', 'suppliers', count, 'success', `Pulled ${totalPulled} suppliers (${count} new)`);
+    console.log(`[Sync] Supplier pull complete: ${stats.created} created, ${stats.updated} updated, ${stats.orphansRemoved} orphans removed`);
+    
+    if (stats.created > 0) {
+      await this.addSyncLog('pull', 'suppliers', stats.created, 'success', `Suppliers: ${stats.created} created, ${stats.orphansRemoved} orphans removed`);
     }
   }
 
@@ -1858,10 +1954,11 @@ class SyncService {
     const PULL_BATCH_SIZE = 1000;
     let offset = 0;
     let hasMore = true;
-    let totalPulled = 0;
-    let count = 0;
+    let stats = { created: 0, updated: 0, orphansRemoved: 0 };
 
-    console.log('[Sync] Starting paginated unit pull...');
+    const cloudNames = new Set<string>();
+
+    console.log('[Sync] Starting full CRUD unit pull with orphan cleanup...');
     this.updateProgress({ currentTable: 'units', message: 'Downloading units...' });
 
     while (hasMore) {
@@ -1877,27 +1974,39 @@ class SyncService {
       }
 
       for (const cloud of cloudUnits) {
+        cloudNames.add(cloud.name);
         const localUnit = await db.units.where('name').equals(cloud.name).first();
         if (!localUnit) {
           await db.units.add({ name: cloud.name, symbol: cloud.symbol });
-          count++;
+          stats.created++;
+        } else if (cloud.symbol !== localUnit.symbol) {
+          await db.units.update(localUnit.id!, { symbol: cloud.symbol });
+          stats.updated++;
         }
       }
 
-      totalPulled += cloudUnits.length;
       offset += PULL_BATCH_SIZE;
       hasMore = cloudUnits.length === PULL_BATCH_SIZE;
 
       this.updateProgress({ 
-        message: `Downloaded ${totalPulled} units...`,
+        message: `Downloaded ${offset} units...`,
         processedRecords: this.currentProgress.processedRecords + cloudUnits.length
       });
     }
     
-    console.log(`[Sync] Unit pull complete: ${totalPulled} fetched, ${count} added`);
+    // ORPHAN CLEANUP
+    const allLocalUnits = await db.units.toArray();
+    for (const local of allLocalUnits) {
+      if (!cloudNames.has(local.name)) {
+        await db.units.delete(local.id!);
+        stats.orphansRemoved++;
+      }
+    }
     
-    if (count > 0) {
-      await this.addSyncLog('pull', 'units', count, 'success', `Pulled ${totalPulled} units (${count} new)`);
+    console.log(`[Sync] Unit pull complete: ${stats.created} created, ${stats.updated} updated, ${stats.orphansRemoved} orphans removed`);
+    
+    if (stats.created > 0) {
+      await this.addSyncLog('pull', 'units', stats.created, 'success', `Units: ${stats.created} created, ${stats.orphansRemoved} orphans removed`);
     }
   }
 
@@ -1905,10 +2014,11 @@ class SyncService {
     const PULL_BATCH_SIZE = 1000;
     let offset = 0;
     let hasMore = true;
-    let totalPulled = 0;
-    let count = 0;
+    let stats = { created: 0, updated: 0, orphansRemoved: 0 };
 
-    console.log('[Sync] Starting paginated quick quantities pull...');
+    const cloudLabels = new Set<string>();
+
+    console.log('[Sync] Starting full CRUD quick quantities pull with orphan cleanup...');
     this.updateProgress({ currentTable: 'quick_quantities', message: 'Downloading quick quantities...' });
 
     while (hasMore) {
@@ -1924,27 +2034,39 @@ class SyncService {
       }
 
       for (const cloud of cloudQtys) {
+        cloudLabels.add(cloud.label);
         const localQty = await db.quickQuantities.where('label').equals(cloud.label).first();
         if (!localQty) {
           await db.quickQuantities.add({ value: Number(cloud.value), label: cloud.label });
-          count++;
+          stats.created++;
+        } else if (Number(cloud.value) !== localQty.value) {
+          await db.quickQuantities.update(localQty.id!, { value: Number(cloud.value) });
+          stats.updated++;
         }
       }
 
-      totalPulled += cloudQtys.length;
       offset += PULL_BATCH_SIZE;
       hasMore = cloudQtys.length === PULL_BATCH_SIZE;
 
       this.updateProgress({ 
-        message: `Downloaded ${totalPulled} quick quantities...`,
+        message: `Downloaded ${offset} quick quantities...`,
         processedRecords: this.currentProgress.processedRecords + cloudQtys.length
       });
     }
     
-    console.log(`[Sync] Quick quantities pull complete: ${totalPulled} fetched, ${count} added`);
+    // ORPHAN CLEANUP
+    const allLocalQtys = await db.quickQuantities.toArray();
+    for (const local of allLocalQtys) {
+      if (!cloudLabels.has(local.label)) {
+        await db.quickQuantities.delete(local.id!);
+        stats.orphansRemoved++;
+      }
+    }
     
-    if (count > 0) {
-      await this.addSyncLog('pull', 'quick_quantities', count, 'success', `Pulled ${totalPulled} quick quantities (${count} new)`);
+    console.log(`[Sync] Quick quantities pull complete: ${stats.created} created, ${stats.updated} updated, ${stats.orphansRemoved} orphans removed`);
+    
+    if (stats.created > 0) {
+      await this.addSyncLog('pull', 'quick_quantities', stats.created, 'success', `Quick quantities: ${stats.created} created, ${stats.orphansRemoved} orphans removed`);
     }
   }
 
