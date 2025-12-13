@@ -109,13 +109,19 @@ export const SystemRestore = ({ compact = false }: SystemRestoreProps) => {
         setRestoreMessage('Clearing all cloud data (this may take a while)...');
         setRestoreProgress(40);
 
-        // Clear all cloud data
-        await syncService.clearAllCloudData();
+        // Clear all cloud data with verification
+        const clearResult = await syncService.clearAllCloudData();
+
+        setRestoreProgress(70);
+        
+        // Verify cloud is empty
+        setRestoreMessage('Verifying cloud data cleared...');
+        const verifyResult = await syncService.verifyCloudEmpty();
 
         setRestoreProgress(85);
         setRestoreMessage('Clearing sync timestamps...');
 
-        // Clear sync-related localStorage (already done in clearAllCloudData but ensure it's done)
+        // Clear sync-related localStorage
         syncService.clearAllSyncTimestamps();
 
         setRestoreProgress(95);
@@ -127,10 +133,20 @@ export const SystemRestore = ({ compact = false }: SystemRestoreProps) => {
         setRestoreProgress(100);
         setRestoreMessage('Complete!');
 
-        toast({
-          title: 'Full System Reset Complete',
-          description: 'All local and cloud data has been cleared. The system is ready for fresh data.',
-        });
+        // Show appropriate toast based on verification
+        if (!clearResult.success || !verifyResult.success) {
+          const issues = [...clearResult.failedTables, ...verifyResult.issues];
+          toast({
+            title: 'Partial System Reset',
+            description: `Some data may not have been fully cleared: ${issues.slice(0, 3).join(', ')}${issues.length > 3 ? '...' : ''}. Please try again.`,
+            variant: 'destructive'
+          });
+        } else {
+          toast({
+            title: 'Full System Reset Complete',
+            description: 'All local and cloud data has been cleared and verified. The system is ready for fresh data.',
+          });
+        }
       } else {
         // PARTIAL RESTORE: Restore to specific time period
         setRestoreMessage('Finding transactions to restore...');

@@ -488,8 +488,18 @@ class SyncService {
   }
 
   private startAutoSync() {
+    // Don't start auto-sync if realtime is disabled
+    if (!this.realtimeEnabled) {
+      console.log('[Sync] Auto-sync not started - sync is disabled');
+      return;
+    }
+    
+    if (this.autoSyncInterval) {
+      clearInterval(this.autoSyncInterval);
+    }
+    
     this.autoSyncInterval = window.setInterval(() => {
-      if (this.isOnline && !this.isSyncing) {
+      if (this.isOnline && !this.isSyncing && this.realtimeEnabled) {
         this.sync();
       }
     }, 5 * 60 * 1000);
@@ -557,9 +567,19 @@ class SyncService {
     localStorage.setItem('realtime_sync_enabled', String(enabled));
     
     if (enabled && this.isOnline) {
+      // Enable: Start all sync operations
       this.setupRealtimeSubscriptions();
+      this.startAutoSync();
+      console.log('[Sync] Sync ENABLED - realtime and auto-sync started');
     } else {
+      // Disable: Stop ALL sync operations
       this.cleanupRealtimeSubscriptions();
+      this.stopFallbackPolling();
+      if (this.autoSyncInterval) {
+        clearInterval(this.autoSyncInterval);
+        this.autoSyncInterval = null;
+      }
+      console.log('[Sync] Sync DISABLED - all sync operations stopped');
     }
     
     this.notifyStatusChange();
@@ -1087,27 +1107,27 @@ class SyncService {
 
   // Instant push methods for real-time sync
   async pushProductInstant(product: Product) {
-    if (!this.isOnline) return;
+    if (!this.isOnline || !this.realtimeEnabled) return;
     await this.pushProductsBatch([product]);
   }
 
   async pushCustomerInstant(customer: Customer) {
-    if (!this.isOnline) return;
+    if (!this.isOnline || !this.realtimeEnabled) return;
     await this.pushCustomersBatch([customer]);
   }
 
   async pushSaleInstant(sale: Sale) {
-    if (!this.isOnline) return;
+    if (!this.isOnline || !this.realtimeEnabled) return;
     await this.pushSalesBatch([sale]);
   }
 
   async pushExpenseInstant(expense: Expense) {
-    if (!this.isOnline) return;
+    if (!this.isOnline || !this.realtimeEnabled) return;
     await this.pushExpensesBatch([expense]);
   }
 
   async pushCashierInstant(cashier: Cashier) {
-    if (!this.isOnline) return;
+    if (!this.isOnline || !this.realtimeEnabled) return;
     await this.pushCashiersBatch([cashier]);
   }
 
@@ -1241,40 +1261,38 @@ class SyncService {
   }
 
   // Complete data wipe for system restore "Everything" option
-  async clearAllCloudData() {
-    if (!this.isOnline) return;
+  async clearAllCloudData(): Promise<{ success: boolean; failedTables: string[] }> {
+    if (!this.isOnline) return { success: false, failedTables: ['offline'] };
     
     console.log('[Sync] Clearing ALL cloud data with batch deletion...');
     
-    // Pause realtime and auto-sync during restore
-    this.pauseSync();
+    const failedTables: string[] = [];
+    const tables = ['sales', 'expenses', 'products', 'customers', 'cashiers', 'categories', 'suppliers', 'units', 'quick_quantities', 'settings'] as const;
     
     try {
-      // Delete each table in batches
-      await this.clearTableInBatches('sales');
-      await this.clearTableInBatches('expenses');
-      await this.clearTableInBatches('products');
-      await this.clearTableInBatches('customers');
-      await this.clearTableInBatches('cashiers');
-      await this.clearTableInBatches('categories');
-      await this.clearTableInBatches('suppliers');
-      await this.clearTableInBatches('units');
-      await this.clearTableInBatches('quick_quantities');
-      await this.clearTableInBatches('settings');
+      // Delete each table in batches with verification
+      for (const table of tables) {
+        const result = await this.clearTableInBatches(table);
+        if (!result.success) {
+          failedTables.push(`${table} (${result.remaining} remaining)`);
+        }
+      }
       
       // Clear all sync timestamps
       this.clearAllSyncTimestamps();
       
-      await this.addSyncLog('push', 'all', 0, 'success', 'All cloud data cleared with batch deletion');
-      console.log('[Sync] All cloud data cleared successfully');
+      if (failedTables.length > 0) {
+        await this.addSyncLog('push', 'all', 0, 'error', `Some tables failed to clear: ${failedTables.join(', ')}`);
+        console.error('[Sync] Some tables failed to clear:', failedTables);
+        return { success: false, failedTables };
+      }
       
-      // Resume sync
-      this.resumeSync();
+      await this.addSyncLog('push', 'all', 0, 'success', 'All cloud data cleared with verification');
+      console.log('[Sync] All cloud data cleared and verified successfully');
+      return { success: true, failedTables: [] };
     } catch (error) {
       console.error('[Sync] Error clearing cloud data:', error);
       await this.addSyncLog('push', 'all', 0, 'error', `Failed to clear cloud data: ${error}`);
-      // Resume sync even on error
-      this.resumeSync();
       throw error;
     }
   }
@@ -1308,21 +1326,24 @@ class SyncService {
     this.lastSyncTime = null;
   }
 
-  private async clearTableInBatches(tableName: 'sales' | 'expenses' | 'products' | 'customers' | 'cashiers' | 'categories' | 'suppliers' | 'units' | 'quick_quantities' | 'settings') {
+  private async clearTableInBatches(tableName: 'sales' | 'expenses' | 'products' | 'customers' | 'cashiers' | 'categories' | 'suppliers' | 'units' | 'quick_quantities' | 'settings'): Promise<{ success: boolean; remaining: number }> {
     console.log(`[Sync] Clearing ${tableName}...`);
     let deletedCount = 0;
     let hasMore = true;
+    let retryCount = 0;
+    const MAX_RETRIES = 3;
     
-    while (hasMore) {
+    while (hasMore && retryCount < MAX_RETRIES) {
       // Get batch of IDs to delete
       const { data: batch, error: selectError } = await supabase
         .from(tableName)
         .select('id')
-        .limit(1000);
+        .limit(500); // Smaller batch size for reliability
       
       if (selectError) {
         console.error(`[Sync] Error selecting ${tableName}:`, selectError);
-        break;
+        retryCount++;
+        continue;
       }
       
       if (!batch || batch.length === 0) {
@@ -1338,9 +1359,12 @@ class SyncService {
       
       if (deleteError) {
         console.error(`[Sync] Error deleting ${tableName} batch:`, deleteError);
-        break;
+        retryCount++;
+        continue;
       }
       
+      // Reset retry count on success
+      retryCount = 0;
       deletedCount += ids.length;
       console.log(`[Sync] Deleted ${deletedCount} records from ${tableName}`);
       
@@ -1350,6 +1374,41 @@ class SyncService {
         break;
       }
     }
+    
+    // VERIFICATION: Check if table is actually empty
+    const { count, error: countError } = await supabase
+      .from(tableName)
+      .select('*', { count: 'exact', head: true });
+    
+    const remaining = countError ? -1 : (count || 0);
+    
+    if (remaining > 0) {
+      console.error(`[Sync] WARNING: ${remaining} records still remain in ${tableName} after deletion!`);
+      return { success: false, remaining };
+    }
+    
+    console.log(`[Sync] Successfully cleared ${tableName} (${deletedCount} records deleted)`);
+    return { success: true, remaining: 0 };
+  }
+
+  // Verify all cloud tables are empty
+  async verifyCloudEmpty(): Promise<{ success: boolean; issues: string[] }> {
+    const tables = ['sales', 'expenses', 'products', 'customers', 'cashiers', 'categories', 'suppliers', 'units', 'quick_quantities', 'settings'] as const;
+    const issues: string[] = [];
+    
+    for (const table of tables) {
+      const { count, error } = await supabase
+        .from(table)
+        .select('*', { count: 'exact', head: true });
+      
+      if (error) {
+        issues.push(`${table}: error checking`);
+      } else if (count && count > 0) {
+        issues.push(`${table}: ${count} records remaining`);
+      }
+    }
+    
+    return { success: issues.length === 0, issues };
   }
 
   async updateProductStockInCloud(barcode: string, newStock: number) {
