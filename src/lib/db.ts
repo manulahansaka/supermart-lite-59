@@ -203,6 +203,21 @@ export class POSDatabase extends Dexie {
       quickQuantities: '++id, value, label',
       syncLogs: '++id, timestamp, action, table, status'
     });
+
+    // Version 8: Add role index to cashiers for super_admin lookup
+    this.version(8).stores({
+      products: '++id, barcode, name, category, stock',
+      sales: '++id, timestamp, customerId',
+      customers: '++id, phone, name',
+      settings: '++id',
+      cashiers: '++id, name, role',
+      categories: '++id, name',
+      suppliers: '++id, name',
+      units: '++id, name',
+      expenses: '++id, date, category',
+      quickQuantities: '++id, value, label',
+      syncLogs: '++id, timestamp, action, table, status'
+    });
   }
 }
 
