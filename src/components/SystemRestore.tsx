@@ -93,8 +93,9 @@ export const SystemRestore = ({ compact = false }: SystemRestoreProps) => {
           await db.expenses.clear();
           await db.products.clear();
           await db.customers.clear();
-          // Keep super_admin cashier
-          const superAdmin = await db.cashiers.where('role').equals('super_admin').first();
+        // Keep super_admin cashier - use filter instead of where to avoid index requirement
+          const allCashiers = await db.cashiers.toArray();
+          const superAdmin = allCashiers.find(c => c.role === 'super_admin');
           await db.cashiers.clear();
           if (superAdmin) {
             await db.cashiers.add(superAdmin);
